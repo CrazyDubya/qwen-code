@@ -30,11 +30,13 @@ import {
   type ShellExecutionResult,
   type ShellOutputEvent,
 } from '../services/shellExecutionService.js';
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import * as crypto from 'crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { EOL } from 'node:os';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import * as summarizer from '../utils/summarizer.js';
+import { ToolErrorType } from './tool-error.js';
 import { ToolConfirmationOutcome } from './tools.js';
 import { OUTPUT_UPDATE_INTERVAL_MS } from './shell.js';
 import { createMockWorkspaceContext } from '../test-utils/mockWorkspaceContext.js';
@@ -54,13 +56,19 @@ describe('ShellTool', () => {
       getDebugMode: vi.fn().mockReturnValue(false),
       getTargetDir: vi.fn().mockReturnValue('/test/dir'),
       getSummarizeToolOutputConfig: vi.fn().mockReturnValue(undefined),
-      getWorkspaceContext: () => createMockWorkspaceContext('.'),
+      getWorkspaceContext: vi
+        .fn()
+        .mockReturnValue(createMockWorkspaceContext('/test/dir')),
+      storage: {
+        getUserSkillsDir: vi.fn().mockReturnValue('/test/dir/.qwen/skills'),
+      },
       getGeminiClient: vi.fn(),
       getGitCoAuthor: vi.fn().mockReturnValue({
         enabled: true,
         name: 'Qwen-Coder',
         email: 'qwen-coder@alibabacloud.com',
       }),
+      getShouldUseNodePtyShell: vi.fn().mockReturnValue(false),
     } as unknown as Config;
 
     shellTool = new ShellTool(mockConfig);
@@ -112,17 +120,77 @@ describe('ShellTool', () => {
       ).toThrow('Command cannot be empty.');
     });
 
-    it('should throw an error for a non-existent directory', () => {
-      vi.mocked(fs.existsSync).mockReturnValue(false);
+    it('should throw an error for a relative directory path', () => {
       expect(() =>
         shellTool.build({
           command: 'ls',
           directory: 'rel/path',
           is_background: false,
         }),
-      ).toThrow(
-        "Directory 'rel/path' is not a registered workspace directory.",
+      ).toThrow('Directory must be an absolute path.');
+    });
+
+    it('should throw an error for a directory outside the workspace', () => {
+      (mockConfig.getWorkspaceContext as Mock).mockReturnValue(
+        createMockWorkspaceContext('/test/dir', ['/another/workspace']),
       );
+      expect(() =>
+        shellTool.build({
+          command: 'ls',
+          directory: '/not/in/workspace',
+          is_background: false,
+        }),
+      ).toThrow(
+        "Directory '/not/in/workspace' is not within any of the registered workspace directories.",
+      );
+    });
+
+    it('should throw an error for a directory within the user skills directory', () => {
+      expect(() =>
+        shellTool.build({
+          command: 'ls',
+          directory: '/test/dir/.qwen/skills/my-skill',
+          is_background: false,
+        }),
+      ).toThrow(
+        'Explicitly running shell commands from within the user skills directory is not allowed. Please use absolute paths for command parameter instead.',
+      );
+    });
+
+    it('should throw an error for the user skills directory itself', () => {
+      expect(() =>
+        shellTool.build({
+          command: 'ls',
+          directory: '/test/dir/.qwen/skills',
+          is_background: false,
+        }),
+      ).toThrow(
+        'Explicitly running shell commands from within the user skills directory is not allowed. Please use absolute paths for command parameter instead.',
+      );
+    });
+
+    it('should resolve directory path before checking user skills directory', () => {
+      expect(() =>
+        shellTool.build({
+          command: 'ls',
+          directory: '/test/dir/.qwen/skills/../skills/my-skill',
+          is_background: false,
+        }),
+      ).toThrow(
+        'Explicitly running shell commands from within the user skills directory is not allowed. Please use absolute paths for command parameter instead.',
+      );
+    });
+
+    it('should return an invocation for a valid absolute directory path', () => {
+      (mockConfig.getWorkspaceContext as Mock).mockReturnValue(
+        createMockWorkspaceContext('/test/dir', ['/another/workspace']),
+      );
+      const invocation = shellTool.build({
+        command: 'ls',
+        directory: '/test/dir/subdir',
+        is_background: false,
+      });
+      expect(invocation).toBeDefined();
     });
 
     it('should include background indicator in description when is_background is true', () => {
@@ -140,6 +208,44 @@ describe('ShellTool', () => {
       });
       expect(invocation.getDescription()).not.toContain('[background]');
     });
+
+    describe('is_background parameter coercion', () => {
+      it('should accept string "true" as boolean true', () => {
+        const invocation = shellTool.build({
+          command: 'npm run dev',
+          is_background: 'true' as unknown as boolean,
+        });
+        expect(invocation).toBeDefined();
+        expect(invocation.getDescription()).toContain('[background]');
+      });
+
+      it('should accept string "false" as boolean false', () => {
+        const invocation = shellTool.build({
+          command: 'npm run build',
+          is_background: 'false' as unknown as boolean,
+        });
+        expect(invocation).toBeDefined();
+        expect(invocation.getDescription()).not.toContain('[background]');
+      });
+
+      it('should accept string "True" as boolean true', () => {
+        const invocation = shellTool.build({
+          command: 'npm run dev',
+          is_background: 'True' as unknown as boolean,
+        });
+        expect(invocation).toBeDefined();
+        expect(invocation.getDescription()).toContain('[background]');
+      });
+
+      it('should accept string "False" as boolean false', () => {
+        const invocation = shellTool.build({
+          command: 'npm run build',
+          is_background: 'False' as unknown as boolean,
+        });
+        expect(invocation).toBeDefined();
+        expect(invocation.getDescription()).not.toContain('[background]');
+      });
+    });
   });
 
   describe('execute', () => {
@@ -151,13 +257,12 @@ describe('ShellTool', () => {
       const fullResult: ShellExecutionResult = {
         rawOutput: Buffer.from(result.output || ''),
         output: 'Success',
-        stdout: 'Success',
-        stderr: '',
         exitCode: 0,
         signal: null,
         error: null,
         aborted: false,
         pid: 12345,
+        executionMethod: 'child_process',
         ...result,
       };
       resolveExecutionPromise(fullResult);
@@ -172,7 +277,7 @@ describe('ShellTool', () => {
       resolveShellExecution({ pid: 54321 });
 
       vi.mocked(fs.existsSync).mockReturnValue(true);
-      vi.mocked(fs.readFileSync).mockReturnValue('54321\n54322\n'); // Service PID and background PID
+      vi.mocked(fs.readFileSync).mockReturnValue(`54321${EOL}54322${EOL}`); // Service PID and background PID
 
       const result = await promise;
 
@@ -180,9 +285,11 @@ describe('ShellTool', () => {
       const wrappedCommand = `{ my-command & }; __code=$?; pgrep -g 0 >${tmpFile} 2>&1; exit $__code;`;
       expect(mockShellExecutionService).toHaveBeenCalledWith(
         wrappedCommand,
-        expect.any(String),
+        '/test/dir',
         expect.any(Function),
-        mockAbortSignal,
+        expect.any(AbortSignal),
+        false,
+        {},
       );
       expect(result.llmContent).toContain('Background PIDs: 54322');
       expect(vi.mocked(fs.unlinkSync)).toHaveBeenCalledWith(tmpFile);
@@ -207,7 +314,9 @@ describe('ShellTool', () => {
         wrappedCommand,
         expect.any(String),
         expect.any(Function),
-        mockAbortSignal,
+        expect.any(AbortSignal),
+        false,
+        {},
       );
     });
 
@@ -230,7 +339,9 @@ describe('ShellTool', () => {
         wrappedCommand,
         expect.any(String),
         expect.any(Function),
-        mockAbortSignal,
+        expect.any(AbortSignal),
+        false,
+        {},
       );
     });
 
@@ -253,7 +364,34 @@ describe('ShellTool', () => {
         wrappedCommand,
         expect.any(String),
         expect.any(Function),
-        mockAbortSignal,
+        expect.any(AbortSignal),
+        false,
+        {},
+      );
+    });
+
+    it('should use the provided directory as cwd', async () => {
+      (mockConfig.getWorkspaceContext as Mock).mockReturnValue(
+        createMockWorkspaceContext('/test/dir'),
+      );
+      const invocation = shellTool.build({
+        command: 'ls',
+        directory: '/test/dir/subdir',
+        is_background: false,
+      });
+      const promise = invocation.execute(mockAbortSignal);
+      resolveShellExecution();
+      await promise;
+
+      const tmpFile = path.join(os.tmpdir(), 'shell_pgrep_abcdef.tmp');
+      const wrappedCommand = `{ ls; }; __code=$?; pgrep -g 0 >${tmpFile} 2>&1; exit $__code;`;
+      expect(mockShellExecutionService).toHaveBeenCalledWith(
+        wrappedCommand,
+        '/test/dir/subdir',
+        expect.any(Function),
+        expect.any(AbortSignal),
+        false,
+        {},
       );
     });
 
@@ -267,20 +405,21 @@ describe('ShellTool', () => {
       resolveShellExecution({
         rawOutput: Buffer.from(''),
         output: '',
-        stdout: '',
-        stderr: '',
         exitCode: 0,
         signal: null,
         error: null,
         aborted: false,
         pid: 12345,
+        executionMethod: 'child_process',
       });
       await promise;
       expect(mockShellExecutionService).toHaveBeenCalledWith(
         'dir',
-        expect.any(String),
+        '/test/dir',
         expect.any(Function),
-        mockAbortSignal,
+        expect.any(AbortSignal),
+        false,
+        {},
       );
     });
 
@@ -295,18 +434,35 @@ describe('ShellTool', () => {
         error,
         exitCode: 1,
         output: 'err',
-        stderr: 'err',
         rawOutput: Buffer.from('err'),
-        stdout: '',
         signal: null,
         aborted: false,
         pid: 12345,
+        executionMethod: 'child_process',
       });
 
       const result = await promise;
-      // The final llmContent should contain the user's command, not the wrapper
       expect(result.llmContent).toContain('Error: wrapped command failed');
       expect(result.llmContent).not.toContain('pgrep');
+    });
+
+    it('should return a SHELL_EXECUTE_ERROR for a command failure', async () => {
+      const error = new Error('command failed');
+      const invocation = shellTool.build({
+        command: 'user-command',
+        is_background: false,
+      });
+      const promise = invocation.execute(mockAbortSignal);
+      resolveShellExecution({
+        error,
+        exitCode: 1,
+      });
+
+      const result = await promise;
+
+      expect(result.error).toBeDefined();
+      expect(result.error?.type).toBe(ToolErrorType.SHELL_EXECUTE_ERROR);
+      expect(result.error?.message).toBe('command failed');
     });
 
     it('should throw an error for invalid parameters', () => {
@@ -316,16 +472,13 @@ describe('ShellTool', () => {
     });
 
     it('should throw an error for invalid directory', () => {
-      vi.mocked(fs.existsSync).mockReturnValue(false);
       expect(() =>
         shellTool.build({
           command: 'ls',
           directory: 'nonexistent',
           is_background: false,
         }),
-      ).toThrow(
-        `Directory 'nonexistent' is not a registered workspace directory.`,
-      );
+      ).toThrow('Directory must be an absolute path.');
     });
 
     it('should summarize output when configured', async () => {
@@ -344,13 +497,12 @@ describe('ShellTool', () => {
       resolveExecutionPromise({
         output: 'long output',
         rawOutput: Buffer.from('long output'),
-        stdout: 'long output',
-        stderr: '',
         exitCode: 0,
         signal: null,
         error: null,
         aborted: false,
         pid: 12345,
+        executionMethod: 'child_process',
       });
 
       const result = await promise;
@@ -358,7 +510,7 @@ describe('ShellTool', () => {
       expect(summarizer.summarizeToolOutput).toHaveBeenCalledWith(
         expect.any(String),
         mockConfig.getGeminiClient(),
-        mockAbortSignal,
+        expect.any(AbortSignal),
         1000,
       );
       expect(result.llmContent).toBe('summarized output');
@@ -390,49 +542,6 @@ describe('ShellTool', () => {
       });
       afterEach(() => {
         vi.useRealTimers();
-      });
-
-      it('should throttle text output updates', async () => {
-        const invocation = shellTool.build({
-          command: 'stream',
-          is_background: false,
-        });
-        const promise = invocation.execute(mockAbortSignal, updateOutputMock);
-
-        // First chunk, should be throttled.
-        mockShellOutputCallback({
-          type: 'data',
-          stream: 'stdout',
-          chunk: 'hello ',
-        });
-        expect(updateOutputMock).not.toHaveBeenCalled();
-
-        // Advance time past the throttle interval.
-        await vi.advanceTimersByTimeAsync(OUTPUT_UPDATE_INTERVAL_MS + 1);
-
-        // Send a second chunk. THIS event triggers the update with the CUMULATIVE content.
-        mockShellOutputCallback({
-          type: 'data',
-          stream: 'stderr',
-          chunk: 'world',
-        });
-
-        // It should have been called once now with the combined output.
-        expect(updateOutputMock).toHaveBeenCalledOnce();
-        expect(updateOutputMock).toHaveBeenCalledWith('hello \nworld');
-
-        resolveExecutionPromise({
-          rawOutput: Buffer.from(''),
-          output: '',
-          stdout: '',
-          stderr: '',
-          exitCode: 0,
-          signal: null,
-          error: null,
-          aborted: false,
-          pid: 12345,
-        });
-        await promise;
       });
 
       it('should immediately show binary detection message and throttle progress', async () => {
@@ -472,13 +581,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
         await promise;
       });
@@ -494,13 +602,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -512,7 +619,9 @@ describe('ShellTool', () => {
           ),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -524,13 +633,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -541,7 +649,9 @@ describe('ShellTool', () => {
           ),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -553,13 +663,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -570,7 +679,39 @@ describe('ShellTool', () => {
           ),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
+        );
+      });
+
+      it('should handle git commit with combined short flags like -am', async () => {
+        const command = 'git commit -am "Add feature"';
+        const invocation = shellTool.build({ command, is_background: false });
+        const promise = invocation.execute(mockAbortSignal);
+
+        resolveExecutionPromise({
+          rawOutput: Buffer.from(''),
+          output: '',
+          exitCode: 0,
+          signal: null,
+          error: null,
+          aborted: false,
+          pid: 12345,
+          executionMethod: 'child_process',
+        });
+
+        await promise;
+
+        expect(mockShellExecutionService).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Co-authored-by: Qwen-Coder <qwen-coder@alibabacloud.com>',
+          ),
+          expect.any(String),
+          expect.any(Function),
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -582,13 +723,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -598,7 +738,9 @@ describe('ShellTool', () => {
           expect.stringContaining('npm install'),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -610,13 +752,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -626,7 +767,9 @@ describe('ShellTool', () => {
           expect.stringContaining('git commit'),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -638,13 +781,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -655,7 +797,9 @@ describe('ShellTool', () => {
           ),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -674,13 +818,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -690,7 +833,9 @@ describe('ShellTool', () => {
           expect.stringContaining('git commit -m "Initial commit"'),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
 
@@ -709,13 +854,12 @@ describe('ShellTool', () => {
         resolveExecutionPromise({
           rawOutput: Buffer.from(''),
           output: '',
-          stdout: '',
-          stderr: '',
           exitCode: 0,
           signal: null,
           error: null,
           aborted: false,
           pid: 12345,
+          executionMethod: 'child_process',
         });
 
         await promise;
@@ -726,13 +870,91 @@ describe('ShellTool', () => {
           ),
           expect.any(String),
           expect.any(Function),
-          mockAbortSignal,
+          expect.any(AbortSignal),
+          false,
+          {},
+        );
+      });
+
+      it('should add co-author when git commit is prefixed with cd command', async () => {
+        const command = 'cd /tmp/test && git commit -m "Test commit"';
+        const invocation = shellTool.build({ command, is_background: false });
+        const promise = invocation.execute(mockAbortSignal);
+
+        resolveExecutionPromise({
+          rawOutput: Buffer.from(''),
+          output: '',
+          exitCode: 0,
+          signal: null,
+          error: null,
+          aborted: false,
+          pid: 12345,
+          executionMethod: 'child_process',
+        });
+
+        await promise;
+
+        expect(mockShellExecutionService).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Co-authored-by: Qwen-Coder <qwen-coder@alibabacloud.com>',
+          ),
+          expect.any(String),
+          expect.any(Function),
+          expect.any(AbortSignal),
+          false,
+          {},
+        );
+      });
+
+      it('should add co-author to git commit with multi-line message', async () => {
+        const command = `git commit -m "Fix bug
+
+ This is a detailed description
+ spanning multiple lines"`;
+        const invocation = shellTool.build({ command, is_background: false });
+        const promise = invocation.execute(mockAbortSignal);
+
+        resolveExecutionPromise({
+          rawOutput: Buffer.from(''),
+          output: '',
+          exitCode: 0,
+          signal: null,
+          error: null,
+          aborted: false,
+          pid: 12345,
+          executionMethod: 'child_process',
+        });
+
+        await promise;
+
+        expect(mockShellExecutionService).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Co-authored-by: Qwen-Coder <qwen-coder@alibabacloud.com>',
+          ),
+          expect.any(String),
+          expect.any(Function),
+          expect.any(AbortSignal),
+          false,
+          {},
         );
       });
     });
   });
 
   describe('shouldConfirmExecute', () => {
+    it('should not request confirmation for read-only commands', async () => {
+      const invocation = shellTool.build({
+        command: 'ls -la',
+        is_background: false,
+      });
+
+      const confirmation = await invocation.shouldConfirmExecute(
+        new AbortController().signal,
+      );
+
+      expect(confirmation).toBe(false);
+    });
+
     it('should request confirmation for a new command and whitelist it on "Always"', async () => {
       const params = { command: 'npm install', is_background: false };
       const invocation = shellTool.build(params);
@@ -765,77 +987,299 @@ describe('ShellTool', () => {
       ).toThrow();
     });
   });
-});
 
-describe('validateToolParams', () => {
-  it('should return null for valid directory', () => {
-    const config = {
-      getCoreTools: () => undefined,
-      getExcludeTools: () => undefined,
-      getTargetDir: () => '/root',
-      getWorkspaceContext: () =>
-        createMockWorkspaceContext('/root', ['/users/test']),
-    } as unknown as Config;
-    const shellTool = new ShellTool(config);
-    const result = shellTool.validateToolParams({
-      command: 'ls',
-      directory: 'test',
-      is_background: false,
+  describe('getDescription', () => {
+    it('should return the windows description when on windows', () => {
+      vi.mocked(os.platform).mockReturnValue('win32');
+      const shellTool = new ShellTool(mockConfig);
+      expect(shellTool.description).toMatchSnapshot();
     });
-    expect(result).toBeNull();
+
+    it('should return the non-windows description when not on windows', () => {
+      vi.mocked(os.platform).mockReturnValue('linux');
+      const shellTool = new ShellTool(mockConfig);
+      expect(shellTool.description).toMatchSnapshot();
+    });
   });
 
-  it('should return error for directory outside workspace', () => {
-    const config = {
-      getCoreTools: () => undefined,
-      getExcludeTools: () => undefined,
-      getTargetDir: () => '/root',
-      getWorkspaceContext: () =>
-        createMockWorkspaceContext('/root', ['/users/test']),
-    } as unknown as Config;
-    const shellTool = new ShellTool(config);
-    const result = shellTool.validateToolParams({
-      command: 'ls',
-      directory: 'test2',
-      is_background: false,
-    });
-    expect(result).toContain('is not a registered workspace directory');
-  });
-});
+  describe('Windows background execution', () => {
+    it('should clean up trailing ampersand on Windows for background tasks', async () => {
+      vi.mocked(os.platform).mockReturnValue('win32');
+      const mockAbortSignal = new AbortController().signal;
 
-describe('build', () => {
-  it('should return an invocation for valid directory', () => {
-    const config = {
-      getCoreTools: () => undefined,
-      getExcludeTools: () => undefined,
-      getTargetDir: () => '/root',
-      getWorkspaceContext: () =>
-        createMockWorkspaceContext('/root', ['/users/test']),
-    } as unknown as Config;
-    const shellTool = new ShellTool(config);
-    const invocation = shellTool.build({
-      command: 'ls',
-      directory: 'test',
-      is_background: false,
+      const invocation = shellTool.build({
+        command: 'npm start &',
+        is_background: true,
+      });
+
+      const promise = invocation.execute(mockAbortSignal);
+
+      // Simulate immediate success (process started)
+      resolveExecutionPromise({
+        rawOutput: Buffer.from(''),
+        output: '',
+        exitCode: 0,
+        signal: null,
+        error: null,
+        aborted: false,
+        pid: 12345,
+        executionMethod: 'child_process',
+      });
+
+      await promise;
+
+      expect(mockShellExecutionService).toHaveBeenCalledWith(
+        'npm start',
+        expect.any(String),
+        expect.any(Function),
+        expect.any(AbortSignal),
+        false,
+        {},
+      );
     });
-    expect(invocation).toBeDefined();
   });
 
-  it('should throw an error for directory outside workspace', () => {
-    const config = {
-      getCoreTools: () => undefined,
-      getExcludeTools: () => undefined,
-      getTargetDir: () => '/root',
-      getWorkspaceContext: () =>
-        createMockWorkspaceContext('/root', ['/users/test']),
-    } as unknown as Config;
-    const shellTool = new ShellTool(config);
-    expect(() =>
-      shellTool.build({
-        command: 'ls',
-        directory: 'test2',
+  describe('timeout parameter', () => {
+    it('should validate timeout parameter correctly', () => {
+      // Valid timeout
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 5000,
+        });
+      }).not.toThrow();
+
+      // Valid small timeout
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 500,
+        });
+      }).not.toThrow();
+
+      // Zero timeout
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 0,
+        });
+      }).toThrow('Timeout must be a positive number.');
+
+      // Negative timeout
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: -1000,
+        });
+      }).toThrow('Timeout must be a positive number.');
+
+      // Timeout too large
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 700000,
+        });
+      }).toThrow('Timeout cannot exceed 600000ms (10 minutes).');
+
+      // Non-integer timeout
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 5000.5,
+        });
+      }).toThrow('Timeout must be an integer number of milliseconds.');
+
+      // Non-number timeout (schema validation catches this first)
+      expect(() => {
+        shellTool.build({
+          command: 'echo test',
+          is_background: false,
+          timeout: 'invalid' as unknown as number,
+        });
+      }).toThrow('params/timeout must be number');
+    });
+
+    it('should include timeout in description for foreground commands', () => {
+      const invocation = shellTool.build({
+        command: 'npm test',
         is_background: false,
-      }),
-    ).toThrow('is not a registered workspace directory');
+        timeout: 30000,
+      });
+
+      expect(invocation.getDescription()).toBe('npm test [timeout: 30000ms]');
+    });
+
+    it('should not include timeout in description for background commands', () => {
+      const invocation = shellTool.build({
+        command: 'npm start',
+        is_background: true,
+        timeout: 30000,
+      });
+
+      expect(invocation.getDescription()).toBe('npm start [background]');
+    });
+
+    it('should create combined signal with timeout for foreground execution', async () => {
+      const mockAbortSignal = new AbortController().signal;
+      const invocation = shellTool.build({
+        command: 'sleep 1',
+        is_background: false,
+        timeout: 5000,
+      });
+
+      const promise = invocation.execute(mockAbortSignal);
+
+      resolveExecutionPromise({
+        rawOutput: Buffer.from(''),
+        output: '',
+        exitCode: 0,
+        signal: null,
+        error: null,
+        aborted: false,
+        pid: 12345,
+        executionMethod: 'child_process',
+      });
+
+      await promise;
+
+      // Verify that ShellExecutionService was called with a combined signal
+      expect(mockShellExecutionService).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(Function),
+        expect.any(AbortSignal),
+        false,
+        {},
+      );
+
+      // The signal passed should be different from the original signal
+      const calledSignal = mockShellExecutionService.mock.calls[0][3];
+      expect(calledSignal).not.toBe(mockAbortSignal);
+    });
+
+    it('should not create timeout signal for background execution', async () => {
+      const mockAbortSignal = new AbortController().signal;
+      const invocation = shellTool.build({
+        command: 'npm start',
+        is_background: true,
+        timeout: 5000,
+      });
+
+      const promise = invocation.execute(mockAbortSignal);
+
+      resolveExecutionPromise({
+        rawOutput: Buffer.from(''),
+        output: 'Background command started. PID: 12345',
+        exitCode: 0,
+        signal: null,
+        error: null,
+        aborted: false,
+        pid: 12345,
+        executionMethod: 'child_process',
+      });
+
+      await promise;
+
+      // For background execution, the original signal should be used
+      expect(mockShellExecutionService).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(Function),
+        mockAbortSignal,
+        false,
+        {},
+      );
+    });
+
+    it('should handle timeout vs user cancellation correctly', async () => {
+      const userAbortController = new AbortController();
+      const invocation = shellTool.build({
+        command: 'sleep 10',
+        is_background: false,
+        timeout: 5000,
+      });
+
+      // Mock AbortSignal.timeout and AbortSignal.any
+      const mockTimeoutSignal = {
+        aborted: false,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      } as unknown as AbortSignal;
+
+      const mockCombinedSignal = {
+        aborted: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      } as unknown as AbortSignal;
+
+      const originalAbortSignal = globalThis.AbortSignal;
+      vi.stubGlobal('AbortSignal', {
+        ...originalAbortSignal,
+        timeout: vi.fn().mockReturnValue(mockTimeoutSignal),
+        any: vi.fn().mockReturnValue(mockCombinedSignal),
+      });
+
+      const promise = invocation.execute(userAbortController.signal);
+
+      resolveExecutionPromise({
+        rawOutput: Buffer.from('partial output'),
+        output: 'partial output',
+        exitCode: null,
+        signal: null,
+        error: null,
+        aborted: true,
+        pid: 12345,
+        executionMethod: 'child_process',
+      });
+
+      const result = await promise;
+
+      // Restore original AbortSignal
+      vi.stubGlobal('AbortSignal', originalAbortSignal);
+
+      expect(result.llmContent).toContain('Command timed out after 5000ms');
+      expect(result.llmContent).toContain(
+        'Below is the output before it timed out',
+      );
+    });
+
+    it('should use default timeout behavior when timeout is not specified', async () => {
+      const mockAbortSignal = new AbortController().signal;
+      const invocation = shellTool.build({
+        command: 'echo test',
+        is_background: false,
+      });
+
+      const promise = invocation.execute(mockAbortSignal);
+
+      resolveExecutionPromise({
+        rawOutput: Buffer.from('test'),
+        output: 'test',
+        exitCode: 0,
+        signal: null,
+        error: null,
+        aborted: false,
+        pid: 12345,
+        executionMethod: 'child_process',
+      });
+
+      await promise;
+
+      // Should create a combined signal with the default timeout when no timeout is specified
+      expect(mockShellExecutionService).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(Function),
+        expect.any(AbortSignal),
+        false,
+        {},
+      );
+    });
   });
 });

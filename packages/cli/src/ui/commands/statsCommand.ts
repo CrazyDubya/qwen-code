@@ -4,18 +4,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { MessageType, HistoryItemStats } from '../types.js';
+import type { HistoryItemStats } from '../types.js';
+import { MessageType } from '../types.js';
 import { formatDuration } from '../utils/formatters.js';
 import {
   type CommandContext,
   type SlashCommand,
   CommandKind,
 } from './types.js';
+import { t } from '../../i18n/index.js';
 
 export const statsCommand: SlashCommand = {
   name: 'stats',
   altNames: ['usage'],
-  description: 'check session stats. Usage: /stats [model|tools]',
+  get description() {
+    return t('check session stats. Usage: /stats [model|tools]');
+  },
   kind: CommandKind.BUILT_IN,
   action: (context: CommandContext) => {
     const now = new Date();
@@ -24,7 +28,7 @@ export const statsCommand: SlashCommand = {
       context.ui.addItem(
         {
           type: MessageType.ERROR,
-          text: 'Session start time is unavailable, cannot calculate stats.',
+          text: t('Session start time is unavailable, cannot calculate stats.'),
         },
         Date.now(),
       );
@@ -42,7 +46,9 @@ export const statsCommand: SlashCommand = {
   subCommands: [
     {
       name: 'model',
-      description: 'Show model-specific usage statistics.',
+      get description() {
+        return t('Show model-specific usage statistics.');
+      },
       kind: CommandKind.BUILT_IN,
       action: (context: CommandContext) => {
         context.ui.addItem(
@@ -55,7 +61,9 @@ export const statsCommand: SlashCommand = {
     },
     {
       name: 'tools',
-      description: 'Show tool-specific usage statistics.',
+      get description() {
+        return t('Show tool-specific usage statistics.');
+      },
       kind: CommandKind.BUILT_IN,
       action: (context: CommandContext) => {
         context.ui.addItem(

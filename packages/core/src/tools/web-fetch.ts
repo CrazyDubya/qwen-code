@@ -4,22 +4,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { SchemaValidator } from '../utils/schemaValidator.js';
+import { convert } from 'html-to-text';
+import { ProxyAgent, setGlobalDispatcher } from 'undici';
+import type { Config } from '../config/config.js';
+import { ApprovalMode } from '../config/config.js';
+import { fetchWithTimeout, isPrivateIp } from '../utils/fetch.js';
+import { getResponseText } from '../utils/partUtils.js';
+import { ToolErrorType } from './tool-error.js';
+import type {
+  ToolCallConfirmationDetails,
+  ToolInvocation,
+  ToolResult,
+} from './tools.js';
 import {
   BaseDeclarativeTool,
   BaseToolInvocation,
   Kind,
-  ToolCallConfirmationDetails,
   ToolConfirmationOutcome,
-  ToolInvocation,
-  ToolResult,
 } from './tools.js';
-
-import { Config, ApprovalMode } from '../config/config.js';
-import { getResponseText } from '../utils/generateContentResponseUtilities.js';
-import { fetchWithTimeout, isPrivateIp } from '../utils/fetch.js';
-import { convert } from 'html-to-text';
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
+import { DEFAULT_QWEN_MODEL } from '../config/models.js';
+import { ToolNames, ToolDisplayNames } from './tool-names.js';
 
 const URL_FETCH_TIMEOUT_MS = 10000;
 const MAX_CONTENT_LENGTH = 100000;
@@ -106,6 +110,7 @@ ${textContent}
         [{ role: 'user', parts: [{ text: fallbackPrompt }] }],
         {},
         signal,
+        this.config.getModel() || DEFAULT_QWEN_MODEL,
       );
       const resultText = getResponseText(result) || '';
 
@@ -124,6 +129,10 @@ ${textContent}
       return {
         llmContent: `Error: ${errorMessage}`,
         returnDisplay: `Error: ${errorMessage}`,
+        error: {
+          message: errorMessage,
+          type: ToolErrorType.WEB_FETCH_FALLBACK_FAILED,
+        },
       };
     }
   }
@@ -182,12 +191,12 @@ export class WebFetchTool extends BaseDeclarativeTool<
   WebFetchToolParams,
   ToolResult
 > {
-  static readonly Name: string = 'web_fetch';
+  static readonly Name: string = ToolNames.WEB_FETCH;
 
   constructor(private readonly config: Config) {
     super(
       WebFetchTool.Name,
-      'WebFetch',
+      ToolDisplayNames.WEB_FETCH,
       'Fetches content from a specified URL and processes it using an AI model\n- Takes a URL and a prompt as input\n- Fetches the URL content, converts HTML to markdown\n- Processes the content with the prompt using a small, fast model\n- Returns the model\'s response about the content\n- Use this tool when you need to retrieve and analyze web content\n\nUsage notes:\n  - IMPORTANT: If an MCP-provided web fetch tool is available, prefer using that tool instead of this one, as it may have fewer restrictions. All MCP-provided tools start with "mcp__".\n  - The URL must be a fully-formed valid URL\n  - The prompt should describe what information you want to extract from the page\n  - This tool is read-only and does not modify any files\n  - Results may be summarized if the content is very large\n  - Supports both public and private/localhost URLs using direct fetch',
       Kind.Fetch,
       {
@@ -211,16 +220,9 @@ export class WebFetchTool extends BaseDeclarativeTool<
     }
   }
 
-  protected override validateToolParams(
+  protected override validateToolParamValues(
     params: WebFetchToolParams,
   ): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
-    }
     if (!params.url || params.url.trim() === '') {
       return "The 'url' parameter cannot be empty.";
     }

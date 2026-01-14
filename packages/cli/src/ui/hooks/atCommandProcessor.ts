@@ -4,22 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { PartListUnion, PartUnion } from '@google/genai';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import type { PartListUnion, PartUnion } from '@google/genai';
+import type { AnyToolInvocation, Config } from '@qwen-code/qwen-code-core';
 import {
-  AnyToolInvocation,
-  Config,
   getErrorMessage,
   isNodeError,
   unescapePath,
 } from '@qwen-code/qwen-code-core';
-import {
-  HistoryItem,
-  IndividualToolCallDisplay,
-  ToolCallStatus,
-} from '../types.js';
-import { UseHistoryManagerReturn } from './useHistoryManager.js';
+import type { HistoryItem, IndividualToolCallDisplay } from '../types.js';
+import { ToolCallStatus } from '../types.js';
+import type { UseHistoryManagerReturn } from './useHistoryManager.js';
 
 interface HandleAtCommandParams {
   query: string;
@@ -137,11 +133,8 @@ export async function handleAtCommand({
   );
 
   if (atPathCommandParts.length === 0) {
-    addItem({ type: 'user', text: query }, userMessageTimestamp);
     return { processedQuery: [{ text: query }], shouldProceed: true };
   }
-
-  addItem({ type: 'user', text: query }, userMessageTimestamp);
 
   // Get centralized file discovery service
   const fileDiscovery = config.getFileService();
@@ -153,11 +146,11 @@ export async function handleAtCommand({
   const contentLabelsForDisplay: string[] = [];
   const ignoredByReason: Record<string, string[]> = {
     git: [],
-    gemini: [],
+    qwen: [],
     both: [],
   };
 
-  const toolRegistry = await config.getToolRegistry();
+  const toolRegistry = config.getToolRegistry();
   const readManyFilesTool = toolRegistry.getTool('read_many_files');
   const globTool = toolRegistry.getTool('glob');
 
@@ -209,25 +202,25 @@ export async function handleAtCommand({
       respectFileIgnore.respectGitIgnore &&
       fileDiscovery.shouldIgnoreFile(pathName, {
         respectGitIgnore: true,
-        respectGeminiIgnore: false,
+        respectQwenIgnore: false,
       });
-    const geminiIgnored =
-      respectFileIgnore.respectGeminiIgnore &&
+    const qwenIgnored =
+      respectFileIgnore.respectQwenIgnore &&
       fileDiscovery.shouldIgnoreFile(pathName, {
         respectGitIgnore: false,
-        respectGeminiIgnore: true,
+        respectQwenIgnore: true,
       });
 
-    if (gitIgnored || geminiIgnored) {
+    if (gitIgnored || qwenIgnored) {
       const reason =
-        gitIgnored && geminiIgnored ? 'both' : gitIgnored ? 'git' : 'gemini';
+        gitIgnored && qwenIgnored ? 'both' : gitIgnored ? 'git' : 'qwen';
       ignoredByReason[reason].push(pathName);
       const reasonText =
         reason === 'both'
-          ? 'ignored by both git and gemini'
+          ? 'ignored by both git and qwen'
           : reason === 'git'
             ? 'git-ignored'
-            : 'gemini-ignored';
+            : 'qwen-ignored';
       onDebugMessage(`Path ${pathName} is ${reasonText} and will be skipped.`);
       continue;
     }
@@ -362,20 +355,20 @@ export async function handleAtCommand({
 
   // Inform user about ignored paths
   const totalIgnored =
-    ignoredByReason.git.length +
-    ignoredByReason.gemini.length +
-    ignoredByReason.both.length;
+    ignoredByReason['git'].length +
+    ignoredByReason['qwen'].length +
+    ignoredByReason['both'].length;
 
   if (totalIgnored > 0) {
     const messages = [];
-    if (ignoredByReason.git.length) {
-      messages.push(`Git-ignored: ${ignoredByReason.git.join(', ')}`);
+    if (ignoredByReason['git'].length) {
+      messages.push(`Git-ignored: ${ignoredByReason['git'].join(', ')}`);
     }
-    if (ignoredByReason.gemini.length) {
-      messages.push(`Gemini-ignored: ${ignoredByReason.gemini.join(', ')}`);
+    if (ignoredByReason['qwen'].length) {
+      messages.push(`Qwen-ignored: ${ignoredByReason['qwen'].join(', ')}`);
     }
-    if (ignoredByReason.both.length) {
-      messages.push(`Ignored by both: ${ignoredByReason.both.join(', ')}`);
+    if (ignoredByReason['both'].length) {
+      messages.push(`Ignored by both: ${ignoredByReason['both'].join(', ')}`);
     }
 
     const message = `Ignored ${totalIgnored} files:\n${messages.join('\n')}`;
@@ -406,7 +399,7 @@ export async function handleAtCommand({
     paths: pathSpecsToRead,
     file_filtering_options: {
       respect_git_ignore: respectFileIgnore.respectGitIgnore,
-      respect_gemini_ignore: respectFileIgnore.respectGeminiIgnore,
+      respect_qwen_ignore: respectFileIgnore.respectQwenIgnore,
     },
     // Use configuration setting
   };
@@ -450,7 +443,6 @@ export async function handleAtCommand({
           processedQueryParts.push(part);
         }
       }
-      processedQueryParts.push({ text: '\n--- End of content ---' });
     } else {
       onDebugMessage(
         'read_many_files tool returned no content or empty content.',

@@ -4,19 +4,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import fs from 'fs';
-import path from 'path';
-import { glob } from 'glob';
-import { SchemaValidator } from '../utils/schemaValidator.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { glob, escape } from 'glob';
+import type { ToolInvocation, ToolResult } from './tools.js';
+import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
+import { ToolNames, ToolDisplayNames } from './tool-names.js';
+import { resolveAndValidatePath } from '../utils/paths.js';
+import { type Config } from '../config/config.js';
 import {
-  BaseDeclarativeTool,
-  BaseToolInvocation,
-  Kind,
-  ToolInvocation,
-  ToolResult,
-} from './tools.js';
-import { shortenPath, makeRelative } from '../utils/paths.js';
-import { Config } from '../config/config.js';
+  DEFAULT_FILE_FILTERING_OPTIONS,
+  type FileFilteringOptions,
+} from '../config/constants.js';
+import { ToolErrorType } from './tool-error.js';
+import { getErrorMessage } from '../utils/errors.js';
+import type { FileDiscoveryService } from '../services/fileDiscoveryService.js';
+
+const MAX_FILE_COUNT = 100;
 
 // Subset of 'Path' interface provided by 'glob' that we can implement for testing
 export interface GlobPath {
@@ -67,128 +71,89 @@ export interface GlobToolParams {
    * The directory to search in (optional, defaults to current directory)
    */
   path?: string;
-
-  /**
-   * Whether the search should be case-sensitive (optional, defaults to false)
-   */
-  case_sensitive?: boolean;
-
-  /**
-   * Whether to respect .gitignore patterns (optional, defaults to true)
-   */
-  respect_git_ignore?: boolean;
 }
 
 class GlobToolInvocation extends BaseToolInvocation<
   GlobToolParams,
   ToolResult
 > {
+  private fileService: FileDiscoveryService;
+
   constructor(
     private config: Config,
     params: GlobToolParams,
   ) {
     super(params);
+    this.fileService = config.getFileService();
   }
 
   getDescription(): string {
     let description = `'${this.params.pattern}'`;
     if (this.params.path) {
-      const searchDir = path.resolve(
-        this.config.getTargetDir(),
-        this.params.path || '.',
-      );
-      const relativePath = makeRelative(searchDir, this.config.getTargetDir());
-      description += ` within ${shortenPath(relativePath)}`;
+      description += ` in path '${this.params.path}'`;
     }
+
     return description;
   }
 
   async execute(signal: AbortSignal): Promise<ToolResult> {
     try {
-      const workspaceContext = this.config.getWorkspaceContext();
-      const workspaceDirectories = workspaceContext.getDirectories();
+      // Default to target directory if no path is provided
+      const searchDirAbs = resolveAndValidatePath(
+        this.config,
+        this.params.path,
+      );
+      const searchLocationDescription = this.params.path
+        ? `within ${searchDirAbs}`
+        : `in the workspace directory`;
 
-      // If a specific path is provided, resolve it and check if it's within workspace
-      let searchDirectories: readonly string[];
-      if (this.params.path) {
-        const searchDirAbsolute = path.resolve(
-          this.config.getTargetDir(),
-          this.params.path,
-        );
-        if (!workspaceContext.isPathWithinWorkspace(searchDirAbsolute)) {
-          return {
-            llmContent: `Error: Path "${this.params.path}" is not within any workspace directory`,
-            returnDisplay: `Path is not within workspace`,
-          };
-        }
-        searchDirectories = [searchDirAbsolute];
-      } else {
-        // Search across all workspace directories
-        searchDirectories = workspaceDirectories;
+      // Collect entries from the search directory
+      let pattern = this.params.pattern;
+      const fullPath = path.join(searchDirAbs, pattern);
+      if (fs.existsSync(fullPath)) {
+        pattern = escape(pattern);
       }
 
-      // Get centralized file discovery service
-      const respectGitIgnore =
-        this.params.respect_git_ignore ??
-        this.config.getFileFilteringRespectGitIgnore();
-      const fileDiscovery = this.config.getFileService();
+      const allEntries = (await glob(pattern, {
+        cwd: searchDirAbs,
+        withFileTypes: true,
+        nodir: true,
+        stat: true,
+        nocase: true,
+        dot: true,
+        follow: false,
+        signal,
+      })) as GlobPath[];
 
-      // Collect entries from all search directories
-      let allEntries: GlobPath[] = [];
+      const relativePaths = allEntries.map((p) =>
+        path.relative(this.config.getTargetDir(), p.fullpath()),
+      );
 
-      for (const searchDir of searchDirectories) {
-        const entries = (await glob(this.params.pattern, {
-          cwd: searchDir,
-          withFileTypes: true,
-          nodir: true,
-          stat: true,
-          nocase: !this.params.case_sensitive,
-          dot: true,
-          ignore: ['**/node_modules/**', '**/.git/**'],
-          follow: false,
-          signal,
-        })) as GlobPath[];
+      const { filteredPaths } = this.fileService.filterFilesWithReport(
+        relativePaths,
+        this.getFileFilteringOptions(),
+      );
 
-        allEntries = allEntries.concat(entries);
-      }
+      const normalizePathForComparison = (p: string) =>
+        process.platform === 'win32' || process.platform === 'darwin'
+          ? p.toLowerCase()
+          : p;
 
-      const entries = allEntries;
-
-      // Apply git-aware filtering if enabled and in git repository
-      let filteredEntries = entries;
-      let gitIgnoredCount = 0;
-
-      if (respectGitIgnore) {
-        const relativePaths = entries.map((p) =>
-          path.relative(this.config.getTargetDir(), p.fullpath()),
-        );
-        const filteredRelativePaths = fileDiscovery.filterFiles(relativePaths, {
-          respectGitIgnore,
-        });
-        const filteredAbsolutePaths = new Set(
-          filteredRelativePaths.map((p) =>
+      const filteredAbsolutePaths = new Set(
+        filteredPaths.map((p) =>
+          normalizePathForComparison(
             path.resolve(this.config.getTargetDir(), p),
           ),
-        );
+        ),
+      );
 
-        filteredEntries = entries.filter((entry) =>
-          filteredAbsolutePaths.has(entry.fullpath()),
-        );
-        gitIgnoredCount = entries.length - filteredEntries.length;
-      }
+      const filteredEntries = allEntries.filter((entry) =>
+        filteredAbsolutePaths.has(normalizePathForComparison(entry.fullpath())),
+      );
 
       if (!filteredEntries || filteredEntries.length === 0) {
-        let message = `No files found matching pattern "${this.params.pattern}"`;
-        if (searchDirectories.length === 1) {
-          message += ` within ${searchDirectories[0]}`;
-        } else {
-          message += ` within ${searchDirectories.length} workspace directories`;
-        }
-        if (gitIgnoredCount > 0) {
-          message += ` (${gitIgnoredCount} files were git-ignored)`;
-        }
         return {
-          llmContent: message,
+          llmContent: `No files found matching pattern "${this.params.pattern}" ${searchLocationDescription}`,
           returnDisplay: `No files found`,
         };
       }
@@ -204,36 +169,63 @@ class GlobToolInvocation extends BaseToolInvocation<
         oneDayInMs,
       );
 
-      const sortedAbsolutePaths = sortedEntries.map((entry) =>
+      const totalFileCount = sortedEntries.length;
+      const fileLimit = Math.min(
+        MAX_FILE_COUNT,
+        this.config.getTruncateToolOutputLines(),
+      );
+      const truncated = totalFileCount > fileLimit;
+
+      // Limit to fileLimit if needed
+      const entriesToShow = truncated
+        ? sortedEntries.slice(0, fileLimit)
+        : sortedEntries;
+
+      const sortedAbsolutePaths = entriesToShow.map((entry) =>
         entry.fullpath(),
       );
       const fileListDescription = sortedAbsolutePaths.join('\n');
-      const fileCount = sortedAbsolutePaths.length;
 
-      let resultMessage = `Found ${fileCount} file(s) matching "${this.params.pattern}"`;
-      if (searchDirectories.length === 1) {
-        resultMessage += ` within ${searchDirectories[0]}`;
-      } else {
-        resultMessage += ` across ${searchDirectories.length} workspace directories`;
+      let resultMessage = `Found ${totalFileCount} file(s) matching "${this.params.pattern}" ${searchLocationDescription}`;
+      resultMessage += `, sorted by modification time (newest first):\n---\n${fileListDescription}`;
+
+      // Add truncation notice if needed
+      if (truncated) {
+        const omittedFiles = totalFileCount - fileLimit;
+        const fileTerm = omittedFiles === 1 ? 'file' : 'files';
+        resultMessage += `\n---\n[${omittedFiles} ${fileTerm} truncated] ...`;
       }
-      if (gitIgnoredCount > 0) {
-        resultMessage += ` (${gitIgnoredCount} additional files were git-ignored)`;
-      }
-      resultMessage += `, sorted by modification time (newest first):\n${fileListDescription}`;
 
       return {
         llmContent: resultMessage,
-        returnDisplay: `Found ${fileCount} matching file(s)`,
+        returnDisplay: `Found ${totalFileCount} matching file(s)${truncated ? ' (truncated)' : ''}`,
       };
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       console.error(`GlobLogic execute Error: ${errorMessage}`, error);
+      const rawError = `Error during glob search operation: ${errorMessage}`;
       return {
-        llmContent: `Error during glob search operation: ${errorMessage}`,
-        returnDisplay: `Error: An unexpected error occurred.`,
+        llmContent: rawError,
+        returnDisplay: `Error: ${errorMessage || 'An unexpected error occurred.'}`,
+        error: {
+          message: rawError,
+          type: ToolErrorType.GLOB_EXECUTION_ERROR,
+        },
       };
     }
+  }
+
+  private getFileFilteringOptions(): FileFilteringOptions {
+    const options = this.config.getFileFilteringOptions?.();
+    return {
+      respectGitIgnore:
+        options?.respectGitIgnore ??
+        DEFAULT_FILE_FILTERING_OPTIONS.respectGitIgnore,
+      respectQwenIgnore:
+        options?.respectQwenIgnore ??
+        DEFAULT_FILE_FILTERING_OPTIONS.respectQwenIgnore,
+    };
   }
 }
 
@@ -241,35 +233,24 @@ class GlobToolInvocation extends BaseToolInvocation<
  * Implementation of the Glob tool logic
  */
 export class GlobTool extends BaseDeclarativeTool<GlobToolParams, ToolResult> {
-  static readonly Name = 'glob';
+  static readonly Name = ToolNames.GLOB;
 
   constructor(private config: Config) {
     super(
       GlobTool.Name,
-      'FindFiles',
-      'Efficiently finds files matching specific glob patterns (e.g., `src/**/*.ts`, `**/*.md`), returning absolute paths sorted by modification time (newest first). Ideal for quickly locating files based on their name or path structure, especially in large codebases.',
+      ToolDisplayNames.GLOB,
+      'Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like "**/*.js" or "src/**/*.ts"\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful.',
       Kind.Search,
       {
         properties: {
           pattern: {
-            description:
-              "The glob pattern to match against (e.g., '**/*.py', 'docs/*.md').",
+            description: 'The glob pattern to match files against',
             type: 'string',
           },
           path: {
             description:
-              'Optional: The absolute path to the directory to search within. If omitted, searches the root directory.',
+              'The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path if provided.',
             type: 'string',
-          },
-          case_sensitive: {
-            description:
-              'Optional: Whether the search should be case-sensitive. Defaults to false.',
-            type: 'boolean',
-          },
-          respect_git_ignore: {
-            description:
-              'Optional: Whether to respect .gitignore patterns when finding files. Only available in git repositories. Defaults to true.',
-            type: 'boolean',
           },
         },
         required: ['pattern'],
@@ -281,44 +262,24 @@ export class GlobTool extends BaseDeclarativeTool<GlobToolParams, ToolResult> {
   /**
    * Validates the parameters for the tool.
    */
-  override validateToolParams(params: GlobToolParams): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
-    }
-
-    const searchDirAbsolute = path.resolve(
-      this.config.getTargetDir(),
-      params.path || '.',
-    );
-
-    const workspaceContext = this.config.getWorkspaceContext();
-    if (!workspaceContext.isPathWithinWorkspace(searchDirAbsolute)) {
-      const directories = workspaceContext.getDirectories();
-      return `Search path ("${searchDirAbsolute}") resolves outside the allowed workspace directories: ${directories.join(', ')}`;
-    }
-
-    const targetDir = searchDirAbsolute || this.config.getTargetDir();
-    try {
-      if (!fs.existsSync(targetDir)) {
-        return `Search path does not exist ${targetDir}`;
-      }
-      if (!fs.statSync(targetDir).isDirectory()) {
-        return `Search path is not a directory: ${targetDir}`;
-      }
-    } catch (e: unknown) {
-      return `Error accessing search path: ${e}`;
-    }
-
+  protected override validateToolParamValues(
+    params: GlobToolParams,
+  ): string | null {
     if (
       !params.pattern ||
       typeof params.pattern !== 'string' ||
       params.pattern.trim() === ''
     ) {
       return "The 'pattern' parameter cannot be empty.";
+    }
+
+    // Only validate path if one is provided
+    if (params.path) {
+      try {
+        resolveAndValidatePath(this.config, params.path);
+      } catch (error) {
+        return getErrorMessage(error);
+      }
     }
 
     return null;

@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { execSync } from 'child_process';
-import os from 'os';
+import { execSync } from 'node:child_process';
+import os from 'node:os';
 import { detect as chardetDetect } from 'chardet';
 
 // Cache for system encoding to avoid repeated detection
@@ -34,6 +34,15 @@ export function getCachedEncodingForBuffer(buffer: Buffer): string {
 
   // If we have a cached system encoding, use it
   if (cachedSystemEncoding) {
+    // If the system encoding is not UTF-8 (e.g. Windows CP936), but the buffer
+    // is detected as UTF-8, prefer UTF-8. This handles tools like 'git' which
+    // often output UTF-8 regardless of the system code page.
+    if (cachedSystemEncoding !== 'utf-8') {
+      const detected = detectEncodingFromBuffer(buffer);
+      if (detected === 'utf-8') {
+        return 'utf-8';
+      }
+    }
     return cachedSystemEncoding;
   }
 
@@ -79,7 +88,7 @@ export function getSystemEncoding(): string | null {
   // system encoding. However, these environment variables might not always
   // be set or accurate. Handle cases where none of these variables are set.
   const env = process.env;
-  let locale = env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  let locale = env['LC_ALL'] || env['LC_CTYPE'] || env['LANG'] || '';
 
   // Fallback to querying the system directly when environment variables are missing
   if (!locale) {

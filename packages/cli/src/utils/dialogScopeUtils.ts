@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { SettingScope, LoadedSettings } from '../config/settings.js';
+import type { LoadedSettings } from '../config/settings.js';
+import { SettingScope } from '../config/settings.js';
 import { settingExistsInScope } from './settingsUtils.js';
 
 /**
@@ -13,7 +14,11 @@ import { settingExistsInScope } from './settingsUtils.js';
 export const SCOPE_LABELS = {
   [SettingScope.User]: 'User Settings',
   [SettingScope.Workspace]: 'Workspace Settings',
-  [SettingScope.System]: 'System Settings',
+
+  // TODO: migrate system settings to user settings
+  // we don't want to save settings to system scope, it is a troublemaker
+  // comment it out for now.
+  // [SettingScope.System]: 'System Settings',
 } as const;
 
 /**
@@ -26,7 +31,7 @@ export function getScopeItems() {
       label: SCOPE_LABELS[SettingScope.Workspace],
       value: SettingScope.Workspace,
     },
-    { label: SCOPE_LABELS[SettingScope.System], value: SettingScope.System },
+    // { label: SCOPE_LABELS[SettingScope.System], value: SettingScope.System },
   ];
 }
 

@@ -10,32 +10,22 @@ import reactPlugin from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import prettierConfig from 'eslint-config-prettier';
 import importPlugin from 'eslint-plugin-import';
+import vitest from '@vitest/eslint-plugin';
 import globals from 'globals';
-import licenseHeader from 'eslint-plugin-license-header';
-import path from 'node:path'; // Use node: prefix for built-ins
-import url from 'node:url';
-
-// --- ESM way to get __dirname ---
-const __filename = url.fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-// --- ---
-
-// Determine the monorepo root (assuming eslint.config.js is at the root)
-const projectRoot = __dirname;
 
 export default tseslint.config(
   {
     // Global ignores
     ignores: [
       'node_modules/*',
-      'eslint.config.js',
-      'packages/cli/dist/**',
-      'packages/core/dist/**',
-      'packages/server/dist/**',
-      'packages/vscode-ide-companion/dist/**',
+      'packages/**/dist/**',
       'bundle/**',
       'package/bundle/**',
       '.integration-tests/**',
+      'packages/**/.integration-test/**',
+      'dist/**',
+      'docs-site/.next/**',
+      'docs-site/out/**',
     ],
   },
   eslint.configs.recommended,
@@ -87,6 +77,8 @@ export default tseslint.config(
       },
     },
     rules: {
+      // We use TypeScript for React components; prop-types are unnecessary
+      'react/prop-types': 'off',
       // General Best Practice Rules (subset adapted for flat config)
       '@typescript-eslint/array-type': ['error', { default: 'array-simple' }],
       'arrow-body-style': ['error', 'as-needed'],
@@ -105,6 +97,10 @@ export default tseslint.config(
         'error',
         { ignoreParameters: true, ignoreProperties: true },
       ],
+      '@typescript-eslint/consistent-type-imports': [
+        'error',
+        { disallowTypeAnnotations: false },
+      ],
       '@typescript-eslint/no-namespace': ['error', { allowDeclarations: true }],
       '@typescript-eslint/no-unused-vars': [
         'error',
@@ -119,9 +115,14 @@ export default tseslint.config(
         {
           allow: [
             'react-dom/test-utils',
+            'react-dom/client',
             'memfs/lib/volume.js',
             'yargs/**',
             'msw/node',
+            '**/generated/**',
+            './styles/tailwind.css',
+            './styles/App.css',
+            './styles/style.css'
           ],
         },
       ],
@@ -157,9 +158,28 @@ export default tseslint.config(
       'default-case': 'error',
     },
   },
+  {
+    files: ['packages/*/src/**/*.test.{ts,tsx}', 'packages/**/test/**/*.test.{ts,tsx}'],
+    plugins: {
+      vitest,
+    },
+    rules: {
+      ...vitest.configs.recommended.rules,
+      'vitest/expect-expect': 'off',
+      'vitest/no-commented-out-tests': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+        },
+      ],
+    },
+  },
   // extra settings for scripts that we run directly with node
   {
-    files: ['./scripts/**/*.js', 'esbuild.config.js'],
+    files: ['./scripts/**/*.js', 'esbuild.config.js', 'packages/*/scripts/**/*.js'],
     languageOptions: {
       globals: {
         ...globals.node,
@@ -207,11 +227,26 @@ export default tseslint.config(
       '@typescript-eslint/no-require-imports': 'off',
     },
   },
+  // extra settings for core package scripts
+  {
+    files: ['packages/core/scripts/**/*.js'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+        process: 'readonly',
+        console: 'readonly',
+      },
+    },
+    rules: {
+      'no-restricted-syntax': 'off',
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
   // Prettier config must be last
   prettierConfig,
   // extra settings for scripts that we run directly with node
   {
-    files: ['./integration-tests/**/*.js'],
+    files: ['./integration-tests/**/*.{js,ts,tsx}'],
     languageOptions: {
       globals: {
         ...globals.node,
@@ -228,6 +263,27 @@ export default tseslint.config(
           caughtErrorsIgnorePattern: '^_',
         },
       ],
+    },
+  },
+  // Settings for docs-site directory
+  {
+    files: ['docs-site/**/*.{js,jsx}'],
+    languageOptions: {
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+      parserOptions: {
+        ecmaFeatures: {
+          jsx: true,
+        },
+      },
+    },
+    rules: {
+      // Allow relaxed rules for documentation site
+      '@typescript-eslint/no-unused-vars': 'off',
+      'react/prop-types': 'off',
+      'react/react-in-jsx-scope': 'off',
     },
   },
 );

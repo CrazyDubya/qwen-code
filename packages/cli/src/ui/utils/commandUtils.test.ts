@@ -4,14 +4,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { vi, describe, it, expect, beforeEach, Mock } from 'vitest';
-import { spawn } from 'child_process';
-import { EventEmitter } from 'events';
+import type { Mock } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
+import type { spawn, SpawnOptions } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import {
   isAtCommand,
   isSlashCommand,
   copyToClipboard,
   getUrlOpenCommand,
+  CodePage,
 } from './commandUtils.js';
 
 // Mock child_process
@@ -44,7 +46,7 @@ describe('commandUtils', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     // Dynamically import and set up spawn mock
-    const { spawn } = await import('child_process');
+    const { spawn } = await import('node:child_process');
     mockSpawn = spawn as Mock;
 
     // Create mock child process with stdout/stderr emitters
@@ -100,6 +102,20 @@ describe('commandUtils', () => {
       expect(isSlashCommand('')).toBe(false);
       expect(isSlashCommand('path/to/file')).toBe(false);
       expect(isSlashCommand(' /help')).toBe(false);
+    });
+
+    it('should return false for line comments starting with //', () => {
+      expect(isSlashCommand('// This is a comment')).toBe(false);
+      expect(isSlashCommand('// check if variants base info all filled.')).toBe(
+        false,
+      );
+      expect(isSlashCommand('//comment without space')).toBe(false);
+    });
+
+    it('should return false for block comments starting with /*', () => {
+      expect(isSlashCommand('/* This is a block comment */')).toBe(false);
+      expect(isSlashCommand('/*\n * Multi-line comment\n */')).toBe(false);
+      expect(isSlashCommand('/*comment without space*/')).toBe(false);
     });
   });
 
@@ -173,7 +189,10 @@ describe('commandUtils', () => {
 
         await copyToClipboard(testText);
 
-        expect(mockSpawn).toHaveBeenCalledWith('clip', []);
+        expect(mockSpawn).toHaveBeenCalledWith('cmd', [
+          '/c',
+          `chcp ${CodePage.UTF8} >nul && clip`,
+        ]);
         expect(mockChild.stdin.write).toHaveBeenCalledWith(testText);
         expect(mockChild.stdin.end).toHaveBeenCalled();
       });
@@ -186,6 +205,9 @@ describe('commandUtils', () => {
 
       it('should successfully copy text to clipboard using xclip', async () => {
         const testText = 'Hello, world!';
+        const linuxOptions: SpawnOptions = {
+          stdio: ['pipe', 'inherit', 'pipe'],
+        };
 
         setTimeout(() => {
           mockChild.emit('close', 0);
@@ -193,10 +215,11 @@ describe('commandUtils', () => {
 
         await copyToClipboard(testText);
 
-        expect(mockSpawn).toHaveBeenCalledWith('xclip', [
-          '-selection',
-          'clipboard',
-        ]);
+        expect(mockSpawn).toHaveBeenCalledWith(
+          'xclip',
+          ['-selection', 'clipboard'],
+          linuxOptions,
+        );
         expect(mockChild.stdin.write).toHaveBeenCalledWith(testText);
         expect(mockChild.stdin.end).toHaveBeenCalled();
       });
@@ -204,6 +227,9 @@ describe('commandUtils', () => {
       it('should fall back to xsel when xclip fails', async () => {
         const testText = 'Hello, world!';
         let callCount = 0;
+        const linuxOptions: SpawnOptions = {
+          stdio: ['pipe', 'inherit', 'pipe'],
+        };
 
         mockSpawn.mockImplementation(() => {
           const child = Object.assign(new EventEmitter(), {
@@ -217,7 +243,9 @@ describe('commandUtils', () => {
           setTimeout(() => {
             if (callCount === 0) {
               // First call (xclip) fails
-              child.stderr.emit('data', 'xclip not found');
+              const error = new Error('spawn xclip ENOENT');
+              (error as NodeJS.ErrnoException).code = 'ENOENT';
+              child.emit('error', error);
               child.emit('close', 1);
               callCount++;
             } else {
@@ -232,19 +260,26 @@ describe('commandUtils', () => {
         await copyToClipboard(testText);
 
         expect(mockSpawn).toHaveBeenCalledTimes(2);
-        expect(mockSpawn).toHaveBeenNthCalledWith(1, 'xclip', [
-          '-selection',
-          'clipboard',
-        ]);
-        expect(mockSpawn).toHaveBeenNthCalledWith(2, 'xsel', [
-          '--clipboard',
-          '--input',
-        ]);
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          1,
+          'xclip',
+          ['-selection', 'clipboard'],
+          linuxOptions,
+        );
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          2,
+          'xsel',
+          ['--clipboard', '--input'],
+          linuxOptions,
+        );
       });
 
-      it('should throw error when both xclip and xsel fail', async () => {
+      it('should throw error when both xclip and xsel are not found', async () => {
         const testText = 'Hello, world!';
         let callCount = 0;
+        const linuxOptions: SpawnOptions = {
+          stdio: ['pipe', 'inherit', 'pipe'],
+        };
 
         mockSpawn.mockImplementation(() => {
           const child = Object.assign(new EventEmitter(), {
@@ -253,29 +288,99 @@ describe('commandUtils', () => {
               end: vi.fn(),
             }),
             stderr: new EventEmitter(),
-          });
+          }) as MockChildProcess;
 
           setTimeout(() => {
             if (callCount === 0) {
-              // First call (xclip) fails
-              child.stderr.emit('data', 'xclip command not found');
+              // First call (xclip) fails with ENOENT
+              const error = new Error('spawn xclip ENOENT');
+              (error as NodeJS.ErrnoException).code = 'ENOENT';
+              child.emit('error', error);
               child.emit('close', 1);
               callCount++;
             } else {
-              // Second call (xsel) fails
-              child.stderr.emit('data', 'xsel command not found');
+              // Second call (xsel) fails with ENOENT
+              const error = new Error('spawn xsel ENOENT');
+              (error as NodeJS.ErrnoException).code = 'ENOENT';
+              child.emit('error', error);
               child.emit('close', 1);
             }
           }, 0);
 
           return child as unknown as ReturnType<typeof spawn>;
         });
-
         await expect(copyToClipboard(testText)).rejects.toThrow(
-          /All copy commands failed/,
+          'Please ensure xclip or xsel is installed and configured.',
         );
 
         expect(mockSpawn).toHaveBeenCalledTimes(2);
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          1,
+          'xclip',
+          ['-selection', 'clipboard'],
+          linuxOptions,
+        );
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          2,
+          'xsel',
+          ['--clipboard', '--input'],
+          linuxOptions,
+        );
+      });
+
+      it('should emit error when xclip or xsel fail with stderr output (command installed)', async () => {
+        const testText = 'Hello, world!';
+        let callCount = 0;
+        const linuxOptions: SpawnOptions = {
+          stdio: ['pipe', 'inherit', 'pipe'],
+        };
+        const errorMsg = "Error: Can't open display:";
+        const exitCode = 1;
+
+        mockSpawn.mockImplementation(() => {
+          const child = Object.assign(new EventEmitter(), {
+            stdin: Object.assign(new EventEmitter(), {
+              write: vi.fn(),
+              end: vi.fn(),
+            }),
+            stderr: new EventEmitter(),
+          }) as MockChildProcess;
+
+          setTimeout(() => {
+            // e.g., cannot connect to X server
+            if (callCount === 0) {
+              child.stderr.emit('data', errorMsg);
+              child.emit('close', exitCode);
+              callCount++;
+            } else {
+              child.stderr.emit('data', errorMsg);
+              child.emit('close', exitCode);
+            }
+          }, 0);
+
+          return child as unknown as ReturnType<typeof spawn>;
+        });
+
+        const xclipErrorMsg = `'xclip' exited with code ${exitCode}${errorMsg ? `: ${errorMsg}` : ''}`;
+        const xselErrorMsg = `'xsel' exited with code ${exitCode}${errorMsg ? `: ${errorMsg}` : ''}`;
+
+        await expect(copyToClipboard(testText)).rejects.toThrow(
+          `All copy commands failed. "${xclipErrorMsg}", "${xselErrorMsg}". `,
+        );
+
+        expect(mockSpawn).toHaveBeenCalledTimes(2);
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          1,
+          'xclip',
+          ['-selection', 'clipboard'],
+          linuxOptions,
+        );
+        expect(mockSpawn).toHaveBeenNthCalledWith(
+          2,
+          'xsel',
+          ['--clipboard', '--input'],
+          linuxOptions,
+        );
       });
     });
 

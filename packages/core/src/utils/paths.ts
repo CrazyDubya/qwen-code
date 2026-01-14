@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
-import os from 'os';
-import * as crypto from 'crypto';
+import os from 'node:os';
+import * as crypto from 'node:crypto';
+import type { Config } from '../config/config.js';
+import { isNodeError } from './errors.js';
 
 export const QWEN_DIR = '.qwen';
 export const GOOGLE_ACCOUNTS_FILENAME = 'google_accounts.json';
-const TMP_DIR_NAME = 'tmp';
-const COMMANDS_DIR_NAME = 'commands';
 
 /**
  * Special characters that need to be escaped in file paths for shell compatibility.
@@ -37,7 +38,7 @@ export function tildeifyPath(path: string): string {
  * Shortens a path string if it exceeds maxLen, prioritizing the start and end segments.
  * Example: /path/to/a/very/long/file.txt -> /path/.../long/file.txt
  */
-export function shortenPath(filePath: string, maxLen: number = 35): string {
+export function shortenPath(filePath: string, maxLen: number = 80): string {
   if (filePath.length <= maxLen) {
     return filePath;
   }
@@ -119,6 +120,10 @@ export function makeRelative(
   const resolvedTargetPath = path.resolve(targetPath);
   const resolvedRootDirectory = path.resolve(rootDirectory);
 
+  if (!isSubpath(resolvedRootDirectory, resolvedTargetPath)) {
+    return resolvedTargetPath;
+  }
+
   const relativePath = path.relative(resolvedRootDirectory, resolvedTargetPath);
 
   // If the paths are the same, path.relative returns '', return '.' instead
@@ -175,28 +180,111 @@ export function getProjectHash(projectRoot: string): string {
 }
 
 /**
- * Generates a unique temporary directory path for a project.
- * @param projectRoot The absolute path to the project's root directory.
- * @returns The path to the project's temporary directory.
+ * Checks if a path is a subpath of another path.
+ * @param parentPath The parent path.
+ * @param childPath The child path.
+ * @returns True if childPath is a subpath of parentPath, false otherwise.
  */
-export function getProjectTempDir(projectRoot: string): string {
-  const hash = getProjectHash(projectRoot);
-  return path.join(os.homedir(), QWEN_DIR, TMP_DIR_NAME, hash);
+export function isSubpath(parentPath: string, childPath: string): boolean {
+  const isWindows = os.platform() === 'win32';
+  const pathModule = isWindows ? path.win32 : path;
+
+  // On Windows, path.relative is case-insensitive. On POSIX, it's case-sensitive.
+  const relative = pathModule.relative(parentPath, childPath);
+
+  return (
+    !relative.startsWith(`..${pathModule.sep}`) &&
+    relative !== '..' &&
+    !pathModule.isAbsolute(relative)
+  );
 }
 
 /**
- * Returns the absolute path to the user-level commands directory.
- * @returns The path to the user's commands directory.
+ * Resolves a path with tilde (~) expansion and relative path resolution.
+ * Handles tilde expansion for home directory and resolves relative paths
+ * against the provided base directory or current working directory.
+ *
+ * @param baseDir The base directory to resolve relative paths against (defaults to current working directory)
+ * @param relativePath The path to resolve (can be relative, absolute, or tilde-prefixed)
+ * @returns The resolved absolute path
  */
-export function getUserCommandsDir(): string {
-  return path.join(os.homedir(), QWEN_DIR, COMMANDS_DIR_NAME);
+export function resolvePath(
+  baseDir: string | undefined = process.cwd(),
+  relativePath: string,
+): string {
+  const homeDir = os.homedir();
+
+  if (relativePath === '~') {
+    return homeDir;
+  } else if (relativePath.startsWith('~/')) {
+    return path.join(homeDir, relativePath.slice(2));
+  } else if (path.isAbsolute(relativePath)) {
+    return relativePath;
+  } else {
+    return path.resolve(baseDir, relativePath);
+  }
+}
+
+export interface PathValidationOptions {
+  /**
+   * If true, allows both files and directories. If false (default), only allows directories.
+   */
+  allowFiles?: boolean;
 }
 
 /**
- * Returns the absolute path to the project-level commands directory.
- * @param projectRoot The absolute path to the project's root directory.
- * @returns The path to the project's commands directory.
+ * Validates that a resolved path exists within the workspace boundaries.
+ *
+ * @param config The configuration object containing workspace context
+ * @param resolvedPath The absolute path to validate
+ * @param options Validation options
+ * @throws Error if the path is outside workspace boundaries, doesn't exist, or is not a directory (when allowFiles is false)
  */
-export function getProjectCommandsDir(projectRoot: string): string {
-  return path.join(projectRoot, QWEN_DIR, COMMANDS_DIR_NAME);
+export function validatePath(
+  config: Config,
+  resolvedPath: string,
+  options: PathValidationOptions = {},
+): void {
+  const { allowFiles = false } = options;
+  const workspaceContext = config.getWorkspaceContext();
+
+  if (!workspaceContext.isPathWithinWorkspace(resolvedPath)) {
+    throw new Error('Path is not within workspace');
+  }
+
+  try {
+    const stats = fs.statSync(resolvedPath);
+    if (!allowFiles && !stats.isDirectory()) {
+      throw new Error(`Path is not a directory: ${resolvedPath}`);
+    }
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      throw new Error(`Path does not exist: ${resolvedPath}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Resolves a path relative to the workspace root and verifies that it exists
+ * within the workspace boundaries defined in the config.
+ *
+ * @param config The configuration object
+ * @param relativePath The relative path to resolve (optional, defaults to target directory)
+ * @param options Validation options (e.g., allowFiles to permit file paths)
+ */
+export function resolveAndValidatePath(
+  config: Config,
+  relativePath?: string,
+  options: PathValidationOptions = {},
+): string {
+  const targetDir = config.getTargetDir();
+
+  if (!relativePath) {
+    return targetDir;
+  }
+
+  const resolvedPath = resolvePath(targetDir, relativePath);
+  validatePath(config, resolvedPath, options);
+  return resolvedPath;
 }

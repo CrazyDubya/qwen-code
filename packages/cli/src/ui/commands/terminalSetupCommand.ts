@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { MessageActionReturn, SlashCommand, CommandKind } from './types.js';
+import type { MessageActionReturn, SlashCommand } from './types.js';
+import { CommandKind } from './types.js';
 import { terminalSetup } from '../utils/terminalSetup.js';
+import { t } from '../../i18n/index.js';
 
 /**
  * Command to configure terminal keybindings for multiline input support.
@@ -15,8 +17,11 @@ import { terminalSetup } from '../utils/terminalSetup.js';
  */
 export const terminalSetupCommand: SlashCommand = {
   name: 'terminal-setup',
-  description:
-    'Configure terminal keybindings for multiline input (VS Code, Cursor, Windsurf)',
+  get description() {
+    return t(
+      'Configure terminal keybindings for multiline input (VS Code, Cursor, Windsurf, Trae)',
+    );
+  },
   kind: CommandKind.BUILT_IN,
 
   action: async (): Promise<MessageActionReturn> => {
@@ -26,7 +31,8 @@ export const terminalSetupCommand: SlashCommand = {
       let content = result.message;
       if (result.requiresRestart) {
         content +=
-          '\n\nPlease restart your terminal for the changes to take effect.';
+          '\n\n' +
+          t('Please restart your terminal for the changes to take effect.');
       }
 
       return {
@@ -37,7 +43,9 @@ export const terminalSetupCommand: SlashCommand = {
     } catch (error) {
       return {
         type: 'message',
-        content: `Failed to configure terminal: ${error}`,
+        content: t('Failed to configure terminal: {{error}}', {
+          error: String(error),
+        }),
         messageType: 'error',
       };
     }

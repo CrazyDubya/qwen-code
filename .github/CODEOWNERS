@@ -1,7 +1,3 @@
-# By default, require reviews from the release approvers for all files.
-* @google-gemini/gemini-cli-askmode-approvers
-
-# The following files don't need reviews from the release approvers.
-# These patterns override the rule above.
-**/*.md
-/docs/
+* @tanzhenxin @DennisYu07 @gwinthis @LaZzyMan @pomelo-nwu @Mingholy
+# SDK TypeScript package changes require review from Mingholy
+packages/sdk-typescript/** @Mingholy

@@ -1,22 +1,27 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2025 Qwen
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
-import {
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import type {
   CommandContext,
   SlashCommand,
   SlashCommandActionReturn,
-  CommandKind,
 } from './types.js';
 import { getCurrentGeminiMdFilename } from '@qwen-code/qwen-code-core';
+import { CommandKind } from './types.js';
+import { Text } from 'ink';
+import React from 'react';
+import { t } from '../../i18n/index.js';
 
 export const initCommand: SlashCommand = {
   name: 'init',
-  description: 'Analyzes the project and creates a tailored QWEN.md file.',
+  get description() {
+    return t('Analyzes the project and creates a tailored QWEN.md file.');
+  },
   kind: CommandKind.BUILT_IN,
   action: async (
     context: CommandContext,
@@ -26,7 +31,7 @@ export const initCommand: SlashCommand = {
       return {
         type: 'message',
         messageType: 'error',
-        content: 'Configuration not available.',
+        content: t('Configuration not available.'),
       };
     }
     const targetDir = context.services.config.getTargetDir();
@@ -35,15 +40,27 @@ export const initCommand: SlashCommand = {
 
     try {
       if (fs.existsSync(contextFilePath)) {
-        // If file exists but is empty (or whitespace), continue to initialize; otherwise, bail out
+        // If file exists but is empty (or whitespace), continue to initialize
         try {
           const existing = fs.readFileSync(contextFilePath, 'utf8');
           if (existing && existing.trim().length > 0) {
-            return {
-              type: 'message',
-              messageType: 'info',
-              content: `A ${contextFileName} file already exists in this directory. No changes were made.`,
-            };
+            // File exists and has content - ask for confirmation to overwrite
+            if (!context.overwriteConfirmed) {
+              return {
+                type: 'confirm_action',
+                // TODO: Move to .tsx file to use JSX syntax instead of React.createElement
+                // For now, using React.createElement to maintain .ts compatibility for PR review
+                prompt: React.createElement(
+                  Text,
+                  null,
+                  `A ${contextFileName} file already exists in this directory. Do you want to regenerate it?`,
+                ),
+                originalInvocation: {
+                  raw: context.invocation?.raw || '/init',
+                },
+              };
+            }
+            // User confirmed overwrite, continue with regeneration
           }
         } catch {
           // If we fail to read, conservatively proceed to (re)create the file
