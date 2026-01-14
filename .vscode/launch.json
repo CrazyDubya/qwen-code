@@ -27,7 +27,7 @@
       "outFiles": [
         "${workspaceFolder}/packages/vscode-ide-companion/dist/**/*.js"
       ],
-      "preLaunchTask": "npm: build: vscode-ide-companion"
+      "preLaunchTask": "launch: vscode-ide-companion (copy+build)"
     },
     {
       "name": "Attach",
@@ -73,13 +73,60 @@
       "request": "launch",
       "name": "Launch CLI Non-Interactive",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "start", "--", "-p", "${input:prompt}", "-y"],
+      "runtimeArgs": [
+        "run",
+        "start",
+        "--",
+        "-p",
+        "${input:prompt}",
+        "--output-format",
+        "stream-json"
+      ],
       "skipFiles": ["<node_internals>/**"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "env": {
         "GEMINI_SANDBOX": "false"
       }
+    },
+    {
+      "name": "Debug Integration Test File",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vitest",
+        "run",
+        "--root",
+        "./integration-tests",
+        "--inspect-brk=9229",
+        "${file}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "skipFiles": ["<node_internals>/**"],
+      "env": {
+        "GEMINI_SANDBOX": "false"
+      }
+    },
+    {
+      "name": "Attach by Process ID",
+      "processId": "${command:PickProcess}",
+      "request": "attach",
+      "skipFiles": ["<node_internals>/**"],
+      "type": "node"
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug Current TS File",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "${file}"],
+      "skipFiles": ["<node_internals>/**"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {}
     }
   ],
   "inputs": [
@@ -94,6 +141,12 @@
       "type": "promptString",
       "description": "Enter your prompt for non-interactive mode",
       "default": "Explain this code"
+    },
+    {
+      "id": "debugPort",
+      "type": "promptString",
+      "description": "Enter the debug port number (default: 9229)",
+      "default": "9229"
     }
   ]
 }

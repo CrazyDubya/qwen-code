@@ -4,15 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import * as fs from 'fs/promises';
-import path from 'path';
+import * as fs from 'node:fs/promises';
+import path from 'node:path';
 import {
   type CommandContext,
   type SlashCommand,
   type SlashCommandActionReturn,
   CommandKind,
 } from './types.js';
-import { Config } from '@qwen-code/qwen-code-core';
+import type { Config } from '@qwen-code/qwen-code-core';
 
 async function restoreAction(
   context: CommandContext,
@@ -22,15 +22,13 @@ async function restoreAction(
   const { config, git: gitService } = services;
   const { addItem, loadHistory } = ui;
 
-  const checkpointDir = config?.getProjectTempDir()
-    ? path.join(config.getProjectTempDir(), 'checkpoints')
-    : undefined;
+  const checkpointDir = config?.storage.getProjectTempCheckpointsDir();
 
   if (!checkpointDir) {
     return {
       type: 'message',
       messageType: 'error',
-      content: 'Could not determine the .gemini directory path.',
+      content: 'Could not determine the .qwen directory path.',
     };
   }
 
@@ -125,9 +123,7 @@ async function completion(
 ): Promise<string[]> {
   const { services } = context;
   const { config } = services;
-  const checkpointDir = config?.getProjectTempDir()
-    ? path.join(config.getProjectTempDir(), 'checkpoints')
-    : undefined;
+  const checkpointDir = config?.storage.getProjectTempCheckpointsDir();
   if (!checkpointDir) {
     return [];
   }

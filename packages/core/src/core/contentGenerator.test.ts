@@ -4,45 +4,60 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   createContentGenerator,
-  AuthType,
   createContentGeneratorConfig,
-  ContentGenerator,
+  AuthType,
 } from './contentGenerator.js';
-import { createCodeAssistContentGenerator } from '../code_assist/codeAssist.js';
 import { GoogleGenAI } from '@google/genai';
-import { Config } from '../config/config.js';
-import { LoggingContentGenerator } from './loggingContentGenerator.js';
+import type { Config } from '../config/config.js';
+import { LoggingContentGenerator } from './loggingContentGenerator/index.js';
 
-vi.mock('../code_assist/codeAssist.js');
 vi.mock('@google/genai');
 
-const mockConfig = {
-  getCliVersion: vi.fn().mockReturnValue('1.0.0'),
-} as unknown as Config;
-
 describe('createContentGenerator', () => {
-  it('should create a CodeAssistContentGenerator', async () => {
-    const mockGenerator = {} as unknown as ContentGenerator;
-    vi.mocked(createCodeAssistContentGenerator).mockResolvedValue(
-      mockGenerator as never,
-    );
+  it('should create a Gemini content generator', async () => {
+    const mockConfig = {
+      getUsageStatisticsEnabled: () => true,
+      getContentGeneratorConfig: () => ({}),
+      getCliVersion: () => '1.0.0',
+    } as unknown as Config;
+
+    const mockGenerator = {
+      models: {},
+    } as unknown as GoogleGenAI;
+    vi.mocked(GoogleGenAI).mockImplementation(() => mockGenerator as never);
     const generator = await createContentGenerator(
       {
         model: 'test-model',
-        authType: AuthType.LOGIN_WITH_GOOGLE,
+        apiKey: 'test-api-key',
+        authType: AuthType.USE_GEMINI,
       },
       mockConfig,
     );
-    expect(createCodeAssistContentGenerator).toHaveBeenCalled();
-    expect(generator).toEqual(
-      new LoggingContentGenerator(mockGenerator, mockConfig),
-    );
+    expect(GoogleGenAI).toHaveBeenCalledWith({
+      apiKey: 'test-api-key',
+      vertexai: undefined,
+      httpOptions: {
+        headers: {
+          'User-Agent': expect.any(String),
+          'x-gemini-api-privileged-user-id': expect.any(String),
+        },
+      },
+    });
+    // We expect it to be a LoggingContentGenerator wrapping a GeminiContentGenerator
+    expect(generator).toBeInstanceOf(LoggingContentGenerator);
+    const wrapped = (generator as LoggingContentGenerator).getWrapped();
+    expect(wrapped).toBeDefined();
   });
 
-  it('should create a GoogleGenAI content generator', async () => {
+  it('should create a Gemini content generator with client install id logging disabled', async () => {
+    const mockConfig = {
+      getUsageStatisticsEnabled: () => false,
+      getContentGeneratorConfig: () => ({}),
+      getCliVersion: () => '1.0.0',
+    } as unknown as Config;
     const mockGenerator = {
       models: {},
     } as unknown as GoogleGenAI;
@@ -64,93 +79,35 @@ describe('createContentGenerator', () => {
         },
       },
     });
-    expect(generator).toEqual(
-      new LoggingContentGenerator(
-        (mockGenerator as GoogleGenAI).models,
-        mockConfig,
-      ),
-    );
+    expect(generator).toBeInstanceOf(LoggingContentGenerator);
   });
 });
 
 describe('createContentGeneratorConfig', () => {
-  const originalEnv = process.env;
   const mockConfig = {
-    getModel: vi.fn().mockReturnValue('gemini-pro'),
-    setModel: vi.fn(),
-    flashFallbackHandler: vi.fn(),
-    getProxy: vi.fn(),
-    getEnableOpenAILogging: vi.fn().mockReturnValue(false),
-    getSamplingParams: vi.fn().mockReturnValue(undefined),
-    getContentGeneratorTimeout: vi.fn().mockReturnValue(undefined),
-    getContentGeneratorMaxRetries: vi.fn().mockReturnValue(undefined),
-    getContentGeneratorSamplingParams: vi.fn().mockReturnValue(undefined),
-    getCliVersion: vi.fn().mockReturnValue('1.0.0'),
+    getProxy: () => undefined,
   } as unknown as Config;
 
-  beforeEach(() => {
-    // Reset modules to re-evaluate imports and environment variables
-    vi.resetModules();
-    // Restore process.env before each test
-    process.env = { ...originalEnv };
-    vi.clearAllMocks();
+  it('should preserve provided fields and set authType for QWEN_OAUTH', () => {
+    const cfg = createContentGeneratorConfig(mockConfig, AuthType.QWEN_OAUTH, {
+      model: 'vision-model',
+      apiKey: 'QWEN_OAUTH_DYNAMIC_TOKEN',
+    });
+    expect(cfg.authType).toBe(AuthType.QWEN_OAUTH);
+    expect(cfg.model).toBe('vision-model');
+    expect(cfg.apiKey).toBe('QWEN_OAUTH_DYNAMIC_TOKEN');
   });
 
-  afterAll(() => {
-    // Restore original process.env after all tests
-    process.env = originalEnv;
-  });
-
-  it('should configure for Gemini using GEMINI_API_KEY when set', async () => {
-    process.env.GEMINI_API_KEY = 'env-gemini-key';
-    const config = await createContentGeneratorConfig(
-      mockConfig,
-      AuthType.USE_GEMINI,
-    );
-    expect(config.apiKey).toBe('env-gemini-key');
-    expect(config.vertexai).toBe(false);
-  });
-
-  it('should not configure for Gemini if GEMINI_API_KEY is empty', async () => {
-    process.env.GEMINI_API_KEY = '';
-    const config = await createContentGeneratorConfig(
-      mockConfig,
-      AuthType.USE_GEMINI,
-    );
-    expect(config.apiKey).toBeUndefined();
-    expect(config.vertexai).toBeUndefined();
-  });
-
-  it('should configure for Vertex AI using GOOGLE_API_KEY when set', async () => {
-    process.env.GOOGLE_API_KEY = 'env-google-key';
-    const config = await createContentGeneratorConfig(
-      mockConfig,
-      AuthType.USE_VERTEX_AI,
-    );
-    expect(config.apiKey).toBe('env-google-key');
-    expect(config.vertexai).toBe(true);
-  });
-
-  it('should configure for Vertex AI using GCP project and location when set', async () => {
-    process.env.GOOGLE_CLOUD_PROJECT = 'env-gcp-project';
-    process.env.GOOGLE_CLOUD_LOCATION = 'env-gcp-location';
-    const config = await createContentGeneratorConfig(
-      mockConfig,
-      AuthType.USE_VERTEX_AI,
-    );
-    expect(config.vertexai).toBe(true);
-    expect(config.apiKey).toBeUndefined();
-  });
-
-  it('should not configure for Vertex AI if required env vars are empty', async () => {
-    process.env.GOOGLE_API_KEY = '';
-    process.env.GOOGLE_CLOUD_PROJECT = '';
-    process.env.GOOGLE_CLOUD_LOCATION = '';
-    const config = await createContentGeneratorConfig(
-      mockConfig,
-      AuthType.USE_VERTEX_AI,
-    );
-    expect(config.apiKey).toBeUndefined();
-    expect(config.vertexai).toBeUndefined();
+  it('should not warn or fallback for QWEN_OAUTH (resolution handled by ModelConfigResolver)', () => {
+    const warnSpy = vi
+      .spyOn(console, 'warn')
+      .mockImplementation(() => undefined);
+    const cfg = createContentGeneratorConfig(mockConfig, AuthType.QWEN_OAUTH, {
+      model: 'some-random-model',
+    });
+    expect(cfg.model).toBe('some-random-model');
+    expect(cfg.apiKey).toBeUndefined();
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

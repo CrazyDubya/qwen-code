@@ -5,15 +5,15 @@
  */
 
 import { copyToClipboard } from '../utils/commandUtils.js';
-import {
-  CommandKind,
-  SlashCommand,
-  SlashCommandActionReturn,
-} from './types.js';
+import type { SlashCommand, SlashCommandActionReturn } from './types.js';
+import { CommandKind } from './types.js';
+import { t } from '../../i18n/index.js';
 
 export const copyCommand: SlashCommand = {
   name: 'copy',
-  description: 'Copy the last result or code snippet to clipboard',
+  get description() {
+    return t('Copy the last result or code snippet to clipboard');
+  },
   kind: CommandKind.BUILT_IN,
   action: async (context, _args): Promise<SlashCommandActionReturn | void> => {
     const chat = await context.services.config?.getGeminiClient()?.getChat();
@@ -53,7 +53,7 @@ export const copyCommand: SlashCommand = {
         return {
           type: 'message',
           messageType: 'error',
-          content: 'Failed to copy to the clipboard.',
+          content: `Failed to copy to the clipboard. ${message}`,
         };
       }
     } else {

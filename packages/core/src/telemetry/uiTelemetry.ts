@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'node:events';
 import {
   EVENT_API_ERROR,
   EVENT_API_RESPONSE,
@@ -12,12 +12,22 @@ import {
 } from './constants.js';
 
 import { ToolCallDecision } from './tool-call-decision.js';
-import { ApiErrorEvent, ApiResponseEvent, ToolCallEvent } from './types.js';
+import type {
+  ApiErrorEvent,
+  ApiResponseEvent,
+  ToolCallEvent,
+} from './types.js';
 
 export type UiEvent =
   | (ApiResponseEvent & { 'event.name': typeof EVENT_API_RESPONSE })
   | (ApiErrorEvent & { 'event.name': typeof EVENT_API_ERROR })
   | (ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
+
+export {
+  EVENT_API_ERROR,
+  EVENT_API_RESPONSE,
+  EVENT_TOOL_CALL,
+} from './constants.js';
 
 export interface ToolCallStats {
   count: number;
@@ -63,6 +73,10 @@ export interface SessionMetrics {
     };
     byName: Record<string, ToolCallStats>;
   };
+  files: {
+    totalLinesAdded: number;
+    totalLinesRemoved: number;
+  };
 }
 
 const createInitialModelMetrics = (): ModelMetrics => ({
@@ -95,6 +109,10 @@ const createInitialMetrics = (): SessionMetrics => ({
       [ToolCallDecision.AUTO_ACCEPT]: 0,
     },
     byName: {},
+  },
+  files: {
+    totalLinesAdded: 0,
+    totalLinesRemoved: 0,
   },
 });
 
@@ -132,7 +150,19 @@ export class UiTelemetryService extends EventEmitter {
     return this.#lastPromptTokenCount;
   }
 
-  resetLastPromptTokenCount(): void {
+  setLastPromptTokenCount(lastPromptTokenCount: number): void {
+    this.#lastPromptTokenCount = lastPromptTokenCount;
+    this.emit('update', {
+      metrics: this.#metrics,
+      lastPromptTokenCount: this.#lastPromptTokenCount,
+    });
+  }
+
+  /**
+   * Resets metrics to the initial state (used when resuming a session).
+   */
+  reset(): void {
+    this.#metrics = createInitialMetrics();
     this.#lastPromptTokenCount = 0;
     this.emit('update', {
       metrics: this.#metrics,
@@ -159,8 +189,6 @@ export class UiTelemetryService extends EventEmitter {
     modelMetrics.tokens.cached += event.cached_content_token_count;
     modelMetrics.tokens.thoughts += event.thoughts_token_count;
     modelMetrics.tokens.tool += event.tool_token_count;
-
-    this.#lastPromptTokenCount = event.input_token_count;
   }
 
   private processApiError(event: ApiErrorEvent) {
@@ -171,7 +199,7 @@ export class UiTelemetryService extends EventEmitter {
   }
 
   private processToolCall(event: ToolCallEvent) {
-    const { tools } = this.#metrics;
+    const { tools, files } = this.#metrics;
     tools.totalCalls++;
     tools.totalDurationMs += event.duration_ms;
 
@@ -208,6 +236,16 @@ export class UiTelemetryService extends EventEmitter {
     if (event.decision) {
       tools.totalDecisions[event.decision]++;
       toolStats.decisions[event.decision]++;
+    }
+
+    // Aggregate line count data from metadata
+    if (event.metadata) {
+      if (event.metadata['model_added_lines'] !== undefined) {
+        files.totalLinesAdded += event.metadata['model_added_lines'];
+      }
+      if (event.metadata['model_removed_lines'] !== undefined) {
+        files.totalLinesRemoved += event.metadata['model_removed_lines'];
+      }
     }
   }
 }

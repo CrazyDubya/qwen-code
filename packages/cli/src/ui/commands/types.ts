@@ -4,17 +4,32 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { type ReactNode } from 'react';
-import { Content } from '@google/genai';
-import { HistoryItemWithoutId } from '../types.js';
-import { Config, GitService, Logger } from '@qwen-code/qwen-code-core';
-import { LoadedSettings } from '../../config/settings.js';
-import { UseHistoryManagerReturn } from '../hooks/useHistoryManager.js';
-import type { HistoryItem } from '../types.js';
-import { SessionStatsState } from '../contexts/SessionContext.js';
+import type { ReactNode } from 'react';
+import type { Content, PartListUnion } from '@google/genai';
+import type { Config, GitService, Logger } from '@qwen-code/qwen-code-core';
+import type {
+  HistoryItemWithoutId,
+  HistoryItem,
+  ConfirmationRequest,
+} from '../types.js';
+import type { LoadedSettings } from '../../config/settings.js';
+import type { UseHistoryManagerReturn } from '../hooks/useHistoryManager.js';
+import type { SessionStatsState } from '../contexts/SessionContext.js';
+import type {
+  ExtensionUpdateAction,
+  ExtensionUpdateStatus,
+} from '../state/extensions.js';
 
 // Grouped dependencies for clarity and easier mocking
 export interface CommandContext {
+  /**
+   * Execution mode for the current invocation.
+   *
+   * - interactive: React/Ink UI mode
+   * - non_interactive: non-interactive CLI mode (text/json)
+   * - acp: ACP/Zed integration mode
+   */
+  executionMode?: 'interactive' | 'non_interactive' | 'acp';
   // Invocation properties for when commands are called.
   invocation?: {
     /** The raw, untrimmed input string from the user. */
@@ -30,7 +45,7 @@ export interface CommandContext {
     config: Config | null;
     settings: LoadedSettings;
     git: GitService | undefined;
-    logger: Logger;
+    logger: Logger | null;
   };
   // UI state and history management
   ui: {
@@ -57,18 +72,20 @@ export interface CommandContext {
      * @param history The array of history items to load.
      */
     loadHistory: UseHistoryManagerReturn['loadHistory'];
-    /** Toggles a special display mode. */
-    toggleCorgiMode: () => void;
     toggleVimEnabled: () => Promise<boolean>;
     setGeminiMdFileCount: (count: number) => void;
     reloadCommands: () => void;
+    extensionsUpdateState: Map<string, ExtensionUpdateStatus>;
+    dispatchExtensionStateUpdate: (action: ExtensionUpdateAction) => void;
+    addConfirmUpdateExtensionRequest: (value: ConfirmationRequest) => void;
   };
   // Session-specific data
   session: {
     stats: SessionStatsState;
-    resetSession: () => void;
     /** A transient list of shell commands the user has approved for this session. */
     sessionShellAllowlist: Set<string>;
+    /** Reset session metrics and prompt counters for a fresh session. */
+    startNewSession?: (sessionId: string) => void;
   };
   // Flag to indicate if an overwrite has been confirmed
   overwriteConfirmed?: boolean;
@@ -100,12 +117,36 @@ export interface MessageActionReturn {
 }
 
 /**
+ * The return type for a command action that streams multiple messages.
+ * Used for long-running operations that need to send progress updates.
+ */
+export interface StreamMessagesActionReturn {
+  type: 'stream_messages';
+  messages: AsyncGenerator<
+    { messageType: 'info' | 'error'; content: string },
+    void,
+    unknown
+  >;
+}
+
+/**
  * The return type for a command action that needs to open a dialog.
  */
 export interface OpenDialogActionReturn {
   type: 'dialog';
 
-  dialog: 'help' | 'auth' | 'theme' | 'editor' | 'privacy' | 'settings';
+  dialog:
+    | 'help'
+    | 'auth'
+    | 'theme'
+    | 'editor'
+    | 'settings'
+    | 'model'
+    | 'subagent_create'
+    | 'subagent_list'
+    | 'permissions'
+    | 'approval-mode'
+    | 'resume';
 }
 
 /**
@@ -124,7 +165,7 @@ export interface LoadHistoryActionReturn {
  */
 export interface SubmitPromptActionReturn {
   type: 'submit_prompt';
-  content: string;
+  content: PartListUnion;
 }
 
 /**
@@ -154,6 +195,7 @@ export interface ConfirmActionReturn {
 export type SlashCommandActionReturn =
   | ToolActionReturn
   | MessageActionReturn
+  | StreamMessagesActionReturn
   | QuitActionReturn
   | OpenDialogActionReturn
   | LoadHistoryActionReturn
@@ -167,11 +209,18 @@ export enum CommandKind {
   MCP_PROMPT = 'mcp-prompt',
 }
 
+export interface CommandCompletionItem {
+  value: string;
+  label?: string;
+  description?: string;
+}
+
 // The standardized contract for any command in the system.
 export interface SlashCommand {
   name: string;
   altNames?: string[];
   description: string;
+  hidden?: boolean;
 
   kind: CommandKind;
 
@@ -187,11 +236,11 @@ export interface SlashCommand {
     | SlashCommandActionReturn
     | Promise<void | SlashCommandActionReturn>;
 
-  // Provides argument completion (e.g., completing a tag for `/chat resume <tag>`).
+  // Provides argument completion
   completion?: (
     context: CommandContext,
     partialArg: string,
-  ) => Promise<string[]>;
+  ) => Promise<Array<string | CommandCompletionItem> | null>;
 
   subCommands?: SlashCommand[];
 }

@@ -4,21 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {
-  BaseDeclarativeTool,
-  BaseToolInvocation,
-  Kind,
-  ToolResult,
-} from './tools.js';
-import { FunctionDeclaration } from '@google/genai';
+import type { ToolResult } from './tools.js';
+import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
+import type { FunctionDeclaration } from '@google/genai';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import * as process from 'process';
 
 import { QWEN_DIR } from '../utils/paths.js';
-import { SchemaValidator } from '../utils/schemaValidator.js';
-import { Config } from '../config/config.js';
+import type { Config } from '../config/config.js';
+import { ToolDisplayNames, ToolNames } from './tool-names.js';
 
 export interface TodoItem {
   id: string;
@@ -248,7 +244,8 @@ When in doubt, use this tool. Being proactive with task management demonstrates 
 const TODO_SUBDIR = 'todos';
 
 function getTodoFilePath(sessionId?: string): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || process.cwd();
+  const homeDir =
+    process.env['HOME'] || process.env['USERPROFILE'] || process.cwd();
   const todoDir = path.join(homeDir, QWEN_DIR, TODO_SUBDIR);
 
   // Use sessionId if provided, otherwise fall back to 'default'
@@ -344,11 +341,30 @@ class TodoWriteToolInvocation extends BaseToolInvocation<
         todos: finalTodos,
       };
 
+      // Create plain string format with system reminder
+      const todosJson = JSON.stringify(finalTodos);
+      let llmContent: string;
+
+      if (finalTodos.length === 0) {
+        // Special message for empty todos
+        llmContent = `Todo list has been cleared.
+
+<system-reminder>
+Your todo list is now empty. DO NOT mention this explicitly to the user. You have no pending tasks in your todo list.
+</system-reminder>`;
+      } else {
+        // Normal message for todos with items
+        llmContent = `Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+
+<system-reminder>
+Your todo list has changed. DO NOT mention this explicitly to the user. Here are the latest contents of your todo list: 
+
+${todosJson}. Continue on with the tasks at hand if applicable.
+</system-reminder>`;
+      }
+
       return {
-        llmContent: JSON.stringify({
-          success: true,
-          todos: finalTodos,
-        }),
+        llmContent,
         returnDisplay: todoResultDisplay,
       };
     } catch (error) {
@@ -357,11 +373,16 @@ class TodoWriteToolInvocation extends BaseToolInvocation<
       console.error(
         `[TodoWriteTool] Error executing todo_write: ${errorMessage}`,
       );
+
+      // Create plain string format for error with system reminder
+      const errorLlmContent = `Failed to modify todos. An error occurred during the operation.
+
+<system-reminder>
+Todo list modification failed with error: ${errorMessage}. You may need to retry or handle this error appropriately.
+</system-reminder>`;
+
       return {
-        llmContent: JSON.stringify({
-          success: false,
-          error: `Failed to write todos. Detail: ${errorMessage}`,
-        }),
+        llmContent: errorLlmContent,
         returnDisplay: `Error writing todos: ${errorMessage}`,
       };
     }
@@ -383,7 +404,7 @@ export async function readTodosForSession(
 export async function listTodoSessions(): Promise<string[]> {
   try {
     const homeDir =
-      process.env.HOME || process.env.USERPROFILE || process.cwd();
+      process.env['HOME'] || process.env['USERPROFILE'] || process.cwd();
     const todoDir = path.join(homeDir, QWEN_DIR, TODO_SUBDIR);
     const files = await fs.readdir(todoDir);
     return files
@@ -402,12 +423,12 @@ export class TodoWriteTool extends BaseDeclarativeTool<
   TodoWriteParams,
   ToolResult
 > {
-  static readonly Name: string = todoWriteToolSchemaData.name!;
+  static readonly Name: string = ToolNames.TODO_WRITE;
 
   constructor(private readonly config: Config) {
     super(
       TodoWriteTool.Name,
-      'Todo Write',
+      ToolDisplayNames.TODO_WRITE,
       todoWriteToolDescription,
       Kind.Think,
       todoWriteToolSchemaData.parametersJsonSchema as Record<string, unknown>,
@@ -415,14 +436,6 @@ export class TodoWriteTool extends BaseDeclarativeTool<
   }
 
   override validateToolParams(params: TodoWriteParams): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
-    }
-
     // Validate todos array
     if (!Array.isArray(params.todos)) {
       return 'Parameter "todos" must be an array.';

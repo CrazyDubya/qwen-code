@@ -5,17 +5,15 @@
  */
 
 import { useCallback, useMemo, useEffect } from 'react';
-import { Suggestion } from '../components/SuggestionsDisplay.js';
-import { CommandContext, SlashCommand } from '../commands/types.js';
-import {
-  logicalPosToOffset,
-  TextBuffer,
-} from '../components/shared/text-buffer.js';
+import type { Suggestion } from '../components/SuggestionsDisplay.js';
+import type { CommandContext, SlashCommand } from '../commands/types.js';
+import type { TextBuffer } from '../components/shared/text-buffer.js';
+import { logicalPosToOffset } from '../components/shared/text-buffer.js';
 import { isSlashCommand } from '../utils/commandUtils.js';
 import { toCodePoints } from '../utils/textUtils.js';
 import { useAtCompletion } from './useAtCompletion.js';
 import { useSlashCompletion } from './useSlashCompletion.js';
-import { Config } from '@qwen-code/qwen-code-core';
+import type { Config } from '@qwen-code/qwen-code-core';
 import { useCompletion } from './useCompletion.js';
 
 export enum CompletionMode {
@@ -93,12 +91,7 @@ export function useCommandCompletion(
             backslashCount++;
           }
           if (backslashCount % 2 === 0) {
-            return {
-              completionMode: CompletionMode.IDLE,
-              query: null,
-              completionStart: -1,
-              completionEnd: -1,
-            };
+            break;
           }
         } else if (char === '@') {
           let end = codePoints.length;
@@ -125,6 +118,7 @@ export function useCommandCompletion(
           };
         }
       }
+
       return {
         completionMode: CompletionMode.IDLE,
         query: null,
@@ -202,7 +196,11 @@ export function useCommandCompletion(
         }
       }
 
-      suggestionText += ' ';
+      const lineCodePoints = toCodePoints(buffer.lines[cursorRow] || '');
+      const charAfterCompletion = lineCodePoints[end];
+      if (charAfterCompletion !== ' ') {
+        suggestionText += ' ';
+      }
 
       buffer.replaceRangeByOffset(
         logicalPosToOffset(buffer.lines, cursorRow, start),

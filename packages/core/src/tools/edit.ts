@@ -4,30 +4,42 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as Diff from 'diff';
-import {
-  BaseDeclarativeTool,
-  Kind,
+import type {
   ToolCallConfirmationDetails,
-  ToolConfirmationOutcome,
   ToolEditConfirmationDetails,
   ToolInvocation,
   ToolLocation,
   ToolResult,
-  ToolResultDisplay,
 } from './tools.js';
+import { BaseDeclarativeTool, Kind, ToolConfirmationOutcome } from './tools.js';
 import { ToolErrorType } from './tool-error.js';
-import { SchemaValidator } from '../utils/schemaValidator.js';
 import { makeRelative, shortenPath } from '../utils/paths.js';
 import { isNodeError } from '../utils/errors.js';
-import { Config, ApprovalMode } from '../config/config.js';
-import { ensureCorrectEdit } from '../utils/editCorrector.js';
+import type { Config } from '../config/config.js';
+import { ApprovalMode } from '../config/config.js';
 import { DEFAULT_DIFF_OPTIONS, getDiffStat } from './diffOptions.js';
 import { ReadFileTool } from './read-file.js';
-import { ModifiableDeclarativeTool, ModifyContext } from './modifiable-tool.js';
-import { IDEConnectionStatus } from '../ide/ide-client.js';
+import { ToolNames, ToolDisplayNames } from './tool-names.js';
+import { logFileOperation } from '../telemetry/loggers.js';
+import { FileOperationEvent } from '../telemetry/types.js';
+import { FileOperation } from '../telemetry/metrics.js';
+import { getSpecificMimeType } from '../utils/fileUtils.js';
+import { getLanguageFromFilePath } from '../utils/language-detection.js';
+import type {
+  ModifiableDeclarativeTool,
+  ModifyContext,
+} from './modifiable-tool.js';
+import { IdeClient } from '../ide/ide-client.js';
+import { safeLiteralReplace } from '../utils/textUtils.js';
+import {
+  countOccurrences,
+  extractEditSnippet,
+  maybeAugmentOldStringForDeletion,
+  normalizeEditStrings,
+} from '../utils/editHelper.js';
 
 export function applyReplacement(
   currentContent: string | null,
@@ -46,7 +58,9 @@ export function applyReplacement(
   if (oldString === '' && !isNewFile) {
     return currentContent;
   }
-  return currentContent.replaceAll(oldString, newString);
+
+  // Use intelligent replacement that handles $ sequences safely
+  return safeLiteralReplace(currentContent, oldString, newString);
 }
 
 /**
@@ -69,10 +83,9 @@ export interface EditToolParams {
   new_string: string;
 
   /**
-   * Number of replacements expected. Defaults to 1 if not specified.
-   * Use when you want to replace multiple occurrences.
+   * Replace every occurrence of old_string instead of requiring a unique match.
    */
-  expected_replacements?: number;
+  replace_all?: boolean;
 
   /**
    * Whether the edit was modified manually by the user.
@@ -80,9 +93,9 @@ export interface EditToolParams {
   modified_by_user?: boolean;
 
   /**
-   * Initially proposed string.
+   * Initially proposed content.
    */
-  ai_proposed_string?: string;
+  ai_proposed_content?: string;
 }
 
 interface CalculatedEdit {
@@ -109,11 +122,8 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
    * @returns An object describing the potential edit outcome
    * @throws File system errors if reading the file fails unexpectedly (e.g., permissions)
    */
-  private async calculateEdit(
-    params: EditToolParams,
-    abortSignal: AbortSignal,
-  ): Promise<CalculatedEdit> {
-    const expectedReplacements = params.expected_replacements ?? 1;
+  private async calculateEdit(params: EditToolParams): Promise<CalculatedEdit> {
+    const replaceAll = params.replace_all ?? false;
     let currentContent: string | null = null;
     let fileExists = false;
     let isNewFile = false;
@@ -125,7 +135,9 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       | undefined = undefined;
 
     try {
-      currentContent = fs.readFileSync(params.file_path, 'utf8');
+      currentContent = await this.config
+        .getFileSystemService()
+        .readTextFile(params.file_path);
       // Normalize line endings to LF for consistent processing.
       currentContent = currentContent.replace(/\r\n/g, '\n');
       fileExists = true;
@@ -137,7 +149,15 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       fileExists = false;
     }
 
-    if (params.old_string === '' && !fileExists) {
+    const normalizedStrings = normalizeEditStrings(
+      currentContent,
+      finalOldString,
+      finalNewString,
+    );
+    finalOldString = normalizedStrings.oldString;
+    finalNewString = normalizedStrings.newString;
+
+    if (finalOldString === '' && !fileExists) {
       // Creating a new file
       isNewFile = true;
     } else if (!fileExists) {
@@ -148,18 +168,13 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
         type: ToolErrorType.FILE_NOT_FOUND,
       };
     } else if (currentContent !== null) {
-      // Editing an existing file
-      const correctedEdit = await ensureCorrectEdit(
-        params.file_path,
+      finalOldString = maybeAugmentOldStringForDeletion(
         currentContent,
-        params,
-        this.config.getGeminiClient(),
-        abortSignal,
+        finalOldString,
+        finalNewString,
       );
-      finalOldString = correctedEdit.params.old_string;
-      finalNewString = correctedEdit.params.new_string;
-      occurrences = correctedEdit.occurrences;
 
+      occurrences = countOccurrences(currentContent, finalOldString);
       if (params.old_string === '') {
         // Error: Trying to create a file that already exists
         error = {
@@ -173,13 +188,10 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
           raw: `Failed to edit, 0 occurrences found for old_string in ${params.file_path}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use ${ReadFileTool.Name} tool to verify.`,
           type: ToolErrorType.EDIT_NO_OCCURRENCE_FOUND,
         };
-      } else if (occurrences !== expectedReplacements) {
-        const occurrenceTerm =
-          expectedReplacements === 1 ? 'occurrence' : 'occurrences';
-
+      } else if (!replaceAll && occurrences > 1) {
         error = {
-          display: `Failed to edit, expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences}.`,
-          raw: `Failed to edit, Expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences} for old_string in file: ${params.file_path}`,
+          display: `Failed to edit because the text matches multiple locations. Provide more context or set replace_all to true.`,
+          raw: `Failed to edit. Found ${occurrences} occurrences for old_string in ${params.file_path} but replace_all was not enabled.`,
           type: ToolErrorType.EDIT_EXPECTED_OCCURRENCE_MISMATCH,
         };
       } else if (finalOldString === finalNewString) {
@@ -198,12 +210,23 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       };
     }
 
-    const newContent = applyReplacement(
-      currentContent,
-      finalOldString,
-      finalNewString,
-      isNewFile,
-    );
+    const newContent = !error
+      ? applyReplacement(
+          currentContent,
+          finalOldString,
+          finalNewString,
+          isNewFile,
+        )
+      : (currentContent ?? '');
+
+    if (!error && fileExists && currentContent === newContent) {
+      error = {
+        display:
+          'No changes to apply. The new content is identical to the current content.',
+        raw: `No changes to apply. The new content is identical to the current content in file: ${params.file_path}`,
+        type: ToolErrorType.EDIT_NO_CHANGE,
+      };
+    }
 
     return {
       currentContent,
@@ -227,8 +250,11 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
 
     let editData: CalculatedEdit;
     try {
-      editData = await this.calculateEdit(this.params, abortSignal);
+      editData = await this.calculateEdit(this.params);
     } catch (error) {
+      if (abortSignal.aborted) {
+        throw error;
+      }
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.log(`Error preparing edit: ${errorMsg}`);
       return false;
@@ -248,10 +274,9 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
       'Proposed',
       DEFAULT_DIFF_OPTIONS,
     );
-    const ideClient = this.config.getIdeClient();
+    const ideClient = await IdeClient.getInstance();
     const ideConfirmation =
-      this.config.getIdeMode() &&
-      ideClient?.getConnectionStatus().status === IDEConnectionStatus.Connected
+      this.config.getIdeMode() && ideClient.isDiffingEnabled()
         ? ideClient.openDiff(this.params.file_path, editData.newContent)
         : undefined;
 
@@ -313,8 +338,11 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
   async execute(signal: AbortSignal): Promise<ToolResult> {
     let editData: CalculatedEdit;
     try {
-      editData = await this.calculateEdit(this.params, signal);
+      editData = await this.calculateEdit(this.params);
     } catch (error) {
+      if (signal.aborted) {
+        throw error;
+      }
       const errorMsg = error instanceof Error ? error.message : String(error);
       return {
         llmContent: `Error preparing edit: ${errorMsg}`,
@@ -339,49 +367,71 @@ class EditToolInvocation implements ToolInvocation<EditToolParams, ToolResult> {
 
     try {
       this.ensureParentDirectoriesExist(this.params.file_path);
-      fs.writeFileSync(this.params.file_path, editData.newContent, 'utf8');
+      await this.config
+        .getFileSystemService()
+        .writeTextFile(this.params.file_path, editData.newContent);
 
-      let displayResult: ToolResultDisplay;
-      if (editData.isNewFile) {
-        displayResult = `Created ${shortenPath(makeRelative(this.params.file_path, this.config.getTargetDir()))}`;
-      } else {
-        // Generate diff for display, even though core logic doesn't technically need it
-        // The CLI wrapper will use this part of the ToolResult
-        const fileName = path.basename(this.params.file_path);
-        const fileDiff = Diff.createPatch(
-          fileName,
-          editData.currentContent ?? '', // Should not be null here if not isNewFile
-          editData.newContent,
-          'Current',
-          'Proposed',
-          DEFAULT_DIFF_OPTIONS,
-        );
-        const originallyProposedContent =
-          this.params.ai_proposed_string || this.params.new_string;
-        const diffStat = getDiffStat(
-          fileName,
-          editData.currentContent ?? '',
-          originallyProposedContent,
-          this.params.new_string,
-        );
-        displayResult = {
-          fileDiff,
-          fileName,
-          originalContent: editData.currentContent,
-          newContent: editData.newContent,
-          diffStat,
-        };
-      }
+      const fileName = path.basename(this.params.file_path);
+      const originallyProposedContent =
+        this.params.ai_proposed_content || editData.newContent;
+      const diffStat = getDiffStat(
+        fileName,
+        editData.currentContent ?? '',
+        originallyProposedContent,
+        editData.newContent,
+      );
+
+      const fileDiff = Diff.createPatch(
+        fileName,
+        editData.currentContent ?? '', // Should not be null here if not isNewFile
+        editData.newContent,
+        'Current',
+        'Proposed',
+        DEFAULT_DIFF_OPTIONS,
+      );
+      const displayResult = {
+        fileDiff,
+        fileName,
+        originalContent: editData.currentContent,
+        newContent: editData.newContent,
+        diffStat,
+      };
+
+      // Log file operation for telemetry (without diff_stat to avoid double-counting)
+      const mimetype = getSpecificMimeType(this.params.file_path);
+      const programmingLanguage = getLanguageFromFilePath(
+        this.params.file_path,
+      );
+      const extension = path.extname(this.params.file_path);
+      const operation = editData.isNewFile
+        ? FileOperation.CREATE
+        : FileOperation.UPDATE;
+
+      logFileOperation(
+        this.config,
+        new FileOperationEvent(
+          EditTool.Name,
+          operation,
+          editData.newContent.split('\n').length,
+          mimetype,
+          extension,
+          programmingLanguage,
+        ),
+      );
 
       const llmSuccessMessageParts = [
         editData.isNewFile
           ? `Created new file: ${this.params.file_path} with provided content.`
-          : `Successfully modified file: ${this.params.file_path} (${editData.occurrences} replacements).`,
+          : `The file: ${this.params.file_path} has been updated.`,
       ];
-      if (this.params.modified_by_user) {
-        llmSuccessMessageParts.push(
-          `User modified the \`new_string\` content to be: ${this.params.new_string}.`,
-        );
+
+      const snippetResult = extractEditSnippet(
+        editData.currentContent,
+        editData.newContent,
+      );
+      if (snippetResult) {
+        const snippetText = `Showing lines ${snippetResult.startLine}-${snippetResult.endLine} of ${snippetResult.totalLines} from the edited file:\n\n---\n\n${snippetResult.content}`;
+        llmSuccessMessageParts.push(snippetText);
       }
 
       return {
@@ -419,12 +469,12 @@ export class EditTool
   extends BaseDeclarativeTool<EditToolParams, ToolResult>
   implements ModifiableDeclarativeTool<EditToolParams>
 {
-  static readonly Name = 'replace';
+  static readonly Name = ToolNames.EDIT;
   constructor(private readonly config: Config) {
     super(
       EditTool.Name,
-      'Edit',
-      `Replaces text within a file. By default, replaces a single occurrence, but can replace multiple occurrences when \`expected_replacements\` is specified. This tool requires providing significant context around the change to ensure precise targeting. Always use the ${ReadFileTool.Name} tool to examine the file's current content before attempting a text replacement.
+      ToolDisplayNames.EDIT,
+      `Replaces text within a file. By default, replaces a single occurrence. Set \`replace_all\` to true when you intend to modify every instance of \`old_string\`. This tool requires providing significant context around the change to ensure precise targeting. Always use the ${ReadFileTool.Name} tool to examine the file's current content before attempting a text replacement.
 
       The user has the ability to modify the \`new_string\` content. If modified, this will be stated in the response.
 
@@ -434,7 +484,7 @@ Expectation for required parameters:
 3. \`new_string\` MUST be the exact literal text to replace \`old_string\` with (also including all whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct and idiomatic.
 4. NEVER escape \`old_string\` or \`new_string\`, that would break the exact literal text requirement.
 **Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for \`old_string\`: Must uniquely identify the single instance to change. Include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string matches multiple locations, or does not match exactly, the tool will fail.
-**Multiple replacements:** Set \`expected_replacements\` to the number of occurrences you want to replace. The tool will replace ALL occurrences that match \`old_string\` exactly. Ensure the number of replacements matches your expectation.`,
+**Multiple replacements:** Set \`replace_all\` to true when you want to replace every occurrence that matches \`old_string\`.`,
       Kind.Edit,
       {
         properties: {
@@ -445,7 +495,7 @@ Expectation for required parameters:
           },
           old_string: {
             description:
-              'The exact literal text to replace, preferably unescaped. For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. For multiple replacements, specify expected_replacements parameter. If this string is not the exact literal text (i.e. you escaped it) or does not match exactly, the tool will fail.',
+              'The exact literal text to replace, preferably unescaped. For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string is not the exact literal text (i.e. you escaped it) or does not match exactly, the tool will fail.',
             type: 'string',
           },
           new_string: {
@@ -453,11 +503,10 @@ Expectation for required parameters:
               'The exact literal text to replace `old_string` with, preferably unescaped. Provide the EXACT text. Ensure the resulting code is correct and idiomatic.',
             type: 'string',
           },
-          expected_replacements: {
-            type: 'number',
+          replace_all: {
+            type: 'boolean',
             description:
-              'Number of replacements expected. Defaults to 1 if not specified. Use when you want to replace multiple occurrences.',
-            minimum: 1,
+              'Replace all occurrences of old_string (default false).',
           },
         },
         required: ['file_path', 'old_string', 'new_string'],
@@ -471,13 +520,11 @@ Expectation for required parameters:
    * @param params Parameters to validate
    * @returns Error message string or null if valid
    */
-  override validateToolParams(params: EditToolParams): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
+  protected override validateToolParamValues(
+    params: EditToolParams,
+  ): string | null {
+    if (!params.file_path) {
+      return "The 'file_path' parameter must be non-empty.";
     }
 
     if (!path.isAbsolute(params.file_path)) {
@@ -504,7 +551,9 @@ Expectation for required parameters:
       getFilePath: (params: EditToolParams) => params.file_path,
       getCurrentContent: async (params: EditToolParams): Promise<string> => {
         try {
-          return fs.readFileSync(params.file_path, 'utf8');
+          return this.config
+            .getFileSystemService()
+            .readTextFile(params.file_path);
         } catch (err) {
           if (!isNodeError(err) || err.code !== 'ENOENT') throw err;
           return '';
@@ -512,7 +561,9 @@ Expectation for required parameters:
       },
       getProposedContent: async (params: EditToolParams): Promise<string> => {
         try {
-          const currentContent = fs.readFileSync(params.file_path, 'utf8');
+          const currentContent = await this.config
+            .getFileSystemService()
+            .readTextFile(params.file_path);
           return applyReplacement(
             currentContent,
             params.old_string,
@@ -528,16 +579,13 @@ Expectation for required parameters:
         oldContent: string,
         modifiedProposedContent: string,
         originalParams: EditToolParams,
-      ): EditToolParams => {
-        const content = originalParams.new_string;
-        return {
-          ...originalParams,
-          ai_proposed_string: content,
-          old_string: oldContent,
-          new_string: modifiedProposedContent,
-          modified_by_user: true,
-        };
-      },
+      ): EditToolParams => ({
+        ...originalParams,
+        ai_proposed_content: oldContent,
+        old_string: oldContent,
+        new_string: modifiedProposedContent,
+        modified_by_user: true,
+      }),
     };
   }
 }

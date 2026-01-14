@@ -4,16 +4,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { vi, describe, it, expect, beforeEach, Mock } from 'vitest';
+import type { Mock } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { memoryCommand } from './memoryCommand.js';
-import { type CommandContext, SlashCommand } from './types.js';
+import type { SlashCommand, type CommandContext } from './types.js';
 import { createMockCommandContext } from '../../test-utils/mockCommandContext.js';
 import { MessageType } from '../types.js';
-import { LoadedSettings } from '../../config/settings.js';
+import type { LoadedSettings } from '../../config/settings.js';
+import { readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   getErrorMessage,
   loadServerHierarchicalMemory,
+  QWEN_DIR,
+  setGeminiMdFilename,
   type FileDiscoveryService,
+  type LoadServerHierarchicalMemoryResponse,
 } from '@qwen-code/qwen-code-core';
 
 vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
@@ -29,7 +36,18 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => {
   };
 });
 
+vi.mock('node:fs/promises', () => {
+  const readFile = vi.fn();
+  return {
+    readFile,
+    default: {
+      readFile,
+    },
+  };
+});
+
 const mockLoadServerHierarchicalMemory = loadServerHierarchicalMemory as Mock;
+const mockReadFile = readFile as unknown as Mock;
 
 describe('memoryCommand', () => {
   let mockContext: CommandContext;
@@ -50,6 +68,10 @@ describe('memoryCommand', () => {
     let mockGetGeminiMdFileCount: Mock;
 
     beforeEach(() => {
+      setGeminiMdFilename('QWEN.md');
+      mockReadFile.mockReset();
+      vi.restoreAllMocks();
+
       showCommand = getSubCommand('show');
 
       mockGetUserMemory = vi.fn();
@@ -96,6 +118,52 @@ describe('memoryCommand', () => {
         {
           type: MessageType.INFO,
           text: `Current memory content from 1 file(s):\n\n---\n${memoryContent}\n---`,
+        },
+        expect.any(Number),
+      );
+    });
+
+    it('should show project memory from the configured context file', async () => {
+      const projectCommand = showCommand.subCommands?.find(
+        (cmd) => cmd.name === '--project',
+      );
+      if (!projectCommand?.action) throw new Error('Command has no action');
+
+      setGeminiMdFilename('AGENTS.md');
+      vi.spyOn(process, 'cwd').mockReturnValue('/test/project');
+      mockReadFile.mockResolvedValue('project memory');
+
+      await projectCommand.action(mockContext, '');
+
+      const expectedProjectPath = path.join('/test/project', 'AGENTS.md');
+      expect(mockReadFile).toHaveBeenCalledWith(expectedProjectPath, 'utf-8');
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        {
+          type: MessageType.INFO,
+          text: expect.stringContaining(expectedProjectPath),
+        },
+        expect.any(Number),
+      );
+    });
+
+    it('should show global memory from the configured context file', async () => {
+      const globalCommand = showCommand.subCommands?.find(
+        (cmd) => cmd.name === '--global',
+      );
+      if (!globalCommand?.action) throw new Error('Command has no action');
+
+      setGeminiMdFilename('AGENTS.md');
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/user');
+      mockReadFile.mockResolvedValue('global memory');
+
+      await globalCommand.action(mockContext, '');
+
+      const expectedGlobalPath = path.join('/home/user', QWEN_DIR, 'AGENTS.md');
+      expect(mockReadFile).toHaveBeenCalledWith(expectedGlobalPath, 'utf-8');
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        {
+          type: MessageType.INFO,
+          text: expect.stringContaining('Global memory content'),
         },
         expect.any(Number),
       );
@@ -224,6 +292,7 @@ describe('memoryCommand', () => {
           ignore: [],
           include: [],
         }),
+        getFolderTrust: () => false,
       };
 
       mockContext = createMockCommandContext({
@@ -242,7 +311,7 @@ describe('memoryCommand', () => {
     it('should display success message when memory is refreshed with content', async () => {
       if (!refreshCommand.action) throw new Error('Command has no action');
 
-      const refreshResult = {
+      const refreshResult: LoadServerHierarchicalMemoryResponse = {
         memoryContent: 'new memory content',
         fileCount: 2,
       };

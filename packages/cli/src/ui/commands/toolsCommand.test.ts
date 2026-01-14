@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { toolsCommand } from './toolsCommand.js';
 import { createMockCommandContext } from '../../test-utils/mockCommandContext.js';
 import { MessageType } from '../types.js';
-import { Tool } from '@qwen-code/qwen-code-core';
+import type { Tool } from '@qwen-code/qwen-code-core';
 
 // Mock tools for testing
 const mockTools = [
@@ -31,7 +31,7 @@ describe('toolsCommand', () => {
     const mockContext = createMockCommandContext({
       services: {
         config: {
-          getToolRegistry: () => Promise.resolve(undefined),
+          getToolRegistry: () => undefined,
         },
       },
     });
@@ -52,8 +52,7 @@ describe('toolsCommand', () => {
     const mockContext = createMockCommandContext({
       services: {
         config: {
-          getToolRegistry: () =>
-            Promise.resolve({ getAllTools: () => [] as Tool[] }),
+          getToolRegistry: () => ({ getAllTools: () => [] as Tool[] }),
         },
       },
     });
@@ -62,9 +61,11 @@ describe('toolsCommand', () => {
     await toolsCommand.action(mockContext, '');
 
     expect(mockContext.ui.addItem).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: expect.stringContaining('No tools available'),
-      }),
+      {
+        type: MessageType.TOOLS_LIST,
+        tools: [],
+        showDescriptions: false,
+      },
       expect.any(Number),
     );
   });
@@ -73,8 +74,7 @@ describe('toolsCommand', () => {
     const mockContext = createMockCommandContext({
       services: {
         config: {
-          getToolRegistry: () =>
-            Promise.resolve({ getAllTools: () => mockTools }),
+          getToolRegistry: () => ({ getAllTools: () => mockTools }),
         },
       },
     });
@@ -82,18 +82,19 @@ describe('toolsCommand', () => {
     if (!toolsCommand.action) throw new Error('Action not defined');
     await toolsCommand.action(mockContext, '');
 
-    const message = (mockContext.ui.addItem as vi.Mock).mock.calls[0][0].text;
-    expect(message).not.toContain('Reads files from the local system.');
-    expect(message).toContain('File Reader');
-    expect(message).toContain('Code Editor');
+    const [message] = (mockContext.ui.addItem as vi.Mock).mock.calls[0];
+    expect(message.type).toBe(MessageType.TOOLS_LIST);
+    expect(message.showDescriptions).toBe(false);
+    expect(message.tools).toHaveLength(2);
+    expect(message.tools[0].displayName).toBe('File Reader');
+    expect(message.tools[1].displayName).toBe('Code Editor');
   });
 
   it('should list tools with descriptions when "desc" arg is passed', async () => {
     const mockContext = createMockCommandContext({
       services: {
         config: {
-          getToolRegistry: () =>
-            Promise.resolve({ getAllTools: () => mockTools }),
+          getToolRegistry: () => ({ getAllTools: () => mockTools }),
         },
       },
     });
@@ -101,8 +102,13 @@ describe('toolsCommand', () => {
     if (!toolsCommand.action) throw new Error('Action not defined');
     await toolsCommand.action(mockContext, 'desc');
 
-    const message = (mockContext.ui.addItem as vi.Mock).mock.calls[0][0].text;
-    expect(message).toContain('Reads files from the local system.');
-    expect(message).toContain('Edits code files.');
+    const [message] = (mockContext.ui.addItem as vi.Mock).mock.calls[0];
+    expect(message.type).toBe(MessageType.TOOLS_LIST);
+    expect(message.showDescriptions).toBe(true);
+    expect(message.tools).toHaveLength(2);
+    expect(message.tools[0].description).toBe(
+      'Reads files from the local system.',
+    );
+    expect(message.tools[1].description).toBe('Edits code files.');
   });
 });
